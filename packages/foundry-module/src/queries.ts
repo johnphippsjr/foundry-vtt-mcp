@@ -2221,12 +2221,22 @@ export class QueryHandlers {
         attackTotal = aroll?.total ?? null; crit = !!aroll?.isCritical; fumble = !!aroll?.isFumble;
         hit = crit || (!fumble && attackTotal != null && attackTotal >= AC);
         if (hit) {
-          let dr: any;
-          try { dr = await (activity as any).rollDamage(crit ? { critical: { allow: true } } : {}, { configure: false }, {}); }
-          catch (e) { dr = await (activity as any).rollDamage({}, { configure: false }, {}); }
+          const dr = await (activity as any).rollDamage({}, { configure: false }, {});
           const rolls = Array.isArray(dr) ? dr : [dr];
           damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
           damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
+          // 5e critical hit: roll the damage DICE again and add (flat modifiers are NOT doubled).
+          // dnd5e's decoupled rollDamage does not double base dice on its own headless.
+          if (crit) {
+            const RollCls: any = (globalThis as any).foundry?.dice?.Roll || (globalThis as any).Roll;
+            for (const r of rolls) {
+              for (const term of ((r && r.terms) || [])) {
+                if (term && term.faces && term.number) {
+                  try { const er = new RollCls(`${term.number}d${term.faces}`); await er.evaluate(); damage += er.total; } catch (e) { /* ignore */ }
+                }
+              }
+            }
+          }
           await t.actor.applyDamage([{ value: damage, type: damageType }]);
           hpAfter = t.actor?.system?.attributes?.hp?.value ?? hpBefore;
         }
