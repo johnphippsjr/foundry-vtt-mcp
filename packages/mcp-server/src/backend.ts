@@ -1525,6 +1525,9 @@ async function startBackend(): Promise<void> {
                 case 'get-combat-state':
                   result = await combatTools.handleGetCombatState(args);
                   break;
+                case 'diag-eval':
+                  result = await combatTools.handleDiagEval(args);
+                  break;
                 case 'execute-attack':
                   result = await combatTools.handleExecuteAttack(args);
                   break;

@@ -24,8 +24,13 @@ export class CombatTools {
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   }
 
+  async handleDiagEval(args: { js: string }) {
+    return this.wrap(await this.foundryClient.query('foundry-mcp-bridge.diagEval', { js: args?.js }));
+  }
+
   getToolDefinitions() {
     return [
+      { name: 'diag-eval', description: 'INTERNAL diagnostic: run JS in the GM browser and return the JSON result.', inputSchema: { type: 'object', properties: { js: { type: 'string' } }, required: ['js'] } },
       {
         name: 'start-combat',
         description:

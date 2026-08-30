@@ -54,6 +54,7 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.nextTurn`] = this.handleNextTurn.bind(this);
     CONFIG.queries[`${modulePrefix}.getCombatState`] = this.handleGetCombatState.bind(this);
     CONFIG.queries[`${modulePrefix}.executeAttack`] = this.handleExecuteAttack.bind(this);
+    CONFIG.queries[`${modulePrefix}.diagEval`] = this.handleDiagEval.bind(this);
 
     // Phase 2 & 3: Write operation queries
     CONFIG.queries[`${modulePrefix}.createActorFromCompendium`] =
@@ -2152,6 +2153,16 @@ export class QueryHandlers {
       })),
     };
   }
+  private async handleDiagEval(data: { js: string }): Promise<any> {
+    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      const fn = new Function('return (async () => { ' + data.js + ' })()');
+      const out = await fn();
+      let safe; try { safe = JSON.parse(JSON.stringify(out)); } catch (e) { safe = String(out); }
+      return { success: true, result: safe };
+    } catch (e: any) { return { success: false, error: String((e && (e.stack || e.message)) || e) }; }
+  }
+
   private async handleExecuteAttack(data: { attacker: string; item: string; targets: string[] }): Promise<any> {
     const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
     const MidiQOL = (globalThis as any).MidiQOL;
@@ -2171,14 +2182,61 @@ export class QueryHandlers {
     if (!targetToks.length) throw new Error('No valid targets');
     const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
     attTok.object?.control({ releaseOthers: true });
-    targetToks.forEach((t: any) => t.object?.setTarget(true, { user: game.user, releaseOthers: false }));
-    const before = targetToks.map((t: any) => ({ name: t.name, hp: t.actor?.system?.attributes?.hp?.value }));
-    await MidiQOL.completeActivityUse(activity, { midiOptions: { targetsToUse: new Set(targetObjs), autoRollAttack: true, autoRollDamage: 'always', fastForwardAttack: true, fastForwardDamage: true } }, { configure: false }, {});
-    await new Promise((r) => setTimeout(r, 1500));
-    const results = targetToks.map((t: any, i: number) => {
-      const hpAfter = t.actor?.system?.attributes?.hp?.value;
-      return { target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0) };
-    });
+    const isAttack = activity.type === 'attack' || !!(activity as any).attack;
+    const results: any[] = [];
+
+    if (!isAttack) {
+      // SAVE / non-attack (e.g. Sacred Flame): Midi's workflow rolls the target's save, applies
+      // half/none/full correctly, and writes HP. That path works headless, so use it as-is.
+      targetToks.forEach((t: any) => t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false }));
+      const before = targetToks.map((t: any) => ({ hp: t.actor?.system?.attributes?.hp?.value }));
+      try {
+        await MidiQOL.completeActivityUse(
+          activity,
+          { midiOptions: { targetsToUse: new Set(targetObjs), autoRollAttack: true, autoRollDamage: 'always', fastForwardAttack: true, fastForwardDamage: true } },
+          { configure: false }, {}
+        );
+      } catch (e) { /* swallow late headless UI throw; HP application already happened */ }
+      await new Promise((r) => setTimeout(r, 1200));
+      for (let i = 0; i < targetToks.length; i++) {
+        const t = targetToks[i]; const hpAfter = t.actor?.system?.attributes?.hp?.value;
+        results.push({ target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0), via: 'save' });
+      }
+      return { success: true, attacker: attTok.name, item: item.name, results };
+    }
+
+    // ATTACK-ROLL actions (weapons AND spell attacks like Guiding Bolt): Midi's full use()/
+    // completeActivityUse silently no-ops in the headless GM browser (no workflow, no HP change).
+    // The lower-level roll primitives DO work, so resolve the attack ourselves: roll vs the
+    // target's AC, roll damage on a hit, and apply it. Deterministic and headless-safe.
+    for (const t of targetToks) {
+      const AC = t.actor?.system?.attributes?.ac?.value ?? 10;
+      const hpBefore = t.actor?.system?.attributes?.hp?.value ?? 0;
+      t.object?.setTarget(true, { user: (game as any).user, releaseOthers: true });
+      let attackTotal: number | null = null, crit = false, fumble = false, hit = false;
+      let damage = 0, damageType: string | null = null, hpAfter = hpBefore, error: string | null = null;
+      try {
+        const ar = await (activity as any).rollAttack({}, { configure: false }, {});
+        const aroll = Array.isArray(ar) ? ar[0] : ar;
+        attackTotal = aroll?.total ?? null; crit = !!aroll?.isCritical; fumble = !!aroll?.isFumble;
+        hit = crit || (!fumble && attackTotal != null && attackTotal >= AC);
+        if (hit) {
+          let dr: any;
+          try { dr = await (activity as any).rollDamage(crit ? { critical: { allow: true } } : {}, { configure: false }, {}); }
+          catch (e) { dr = await (activity as any).rollDamage({}, { configure: false }, {}); }
+          const rolls = Array.isArray(dr) ? dr : [dr];
+          damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
+          damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
+          await t.actor.applyDamage([{ value: damage, type: damageType }]);
+          hpAfter = t.actor?.system?.attributes?.hp?.value ?? hpBefore;
+        }
+      } catch (e: any) { error = String((e && (e.stack || e.message)) || e); }
+      results.push({
+        target: t.name, hpBefore, hpAfter, damage: hpBefore - hpAfter,
+        hit, crit, fumble, attackTotal, damageRolled: damage, damageType, targetAC: AC,
+        via: 'attack', error,
+      });
+    }
     return { success: true, attacker: attTok.name, item: item.name, results };
   }
 
