@@ -379,7 +379,7 @@ export class FoundryConnector {
       const timeout = setTimeout(() => {
         this.pendingQueries.delete(queryId);
         reject(new Error(`Query timeout: ${method}`));
-      }, 10000); // 10 second timeout
+      }, 60000); // 60s: heavy headless writes (Midi/DAE hooks + index rebuild) exceed 10s
 
       this.pendingQueries.set(queryId, { resolve, reject, timeout });
 
