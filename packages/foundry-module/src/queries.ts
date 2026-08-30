@@ -2178,6 +2178,16 @@ export class QueryHandlers {
     const activities = [...((item.system.activities as any) || [])];
     const activity = activities.find((a: any) => a.type === 'attack') || activities[0];
     if (!activity) throw new Error('No usable activity on item: ' + data.item);
+    // Spell slots: a leveled spell (not a cantrip) must have a slot to cast, and casting spends one
+    // (in 5e the slot is consumed whether it hits, misses, or the target saves).
+    const spellLevel = (item.type === 'spell' && (item.system.level || 0) > 0) ? item.system.level : 0;
+    if (spellLevel > 0) {
+      const slot = actor.system.spells?.['spell' + spellLevel];
+      if (!slot || (slot.value || 0) <= 0)
+        return { success: false, error: 'No level-' + spellLevel + ' spell slots remaining', attacker: attTok.name, item: item.name };
+    }
+    const consumeSlot = async () => { if (spellLevel > 0) { const s: any = actor.system.spells['spell' + spellLevel];
+      await actor.update({ ['system.spells.spell' + spellLevel + '.value']: Math.max(0, (s.value || 0) - 1) }); } };
 
     const isAttack = activity.type === 'attack' || !!(activity as any).attack;
     const isHeal = activity.type === 'heal';
@@ -2206,9 +2216,12 @@ export class QueryHandlers {
         const before = hp?.value ?? 0, max = hp?.max ?? before;
         const after = Math.min(max, before + healed);
         if (after !== before) await t.actor.update({ 'system.attributes.hp.value': after });
+        if (before <= 0 && after > 0) { const conds = (t.actor.effects || []).filter((e: any) => e.statuses && e.statuses.size > 0).map((e: any) => e.id);
+          if (conds.length) await t.actor.deleteEmbeddedDocuments('ActiveEffect', conds); }
         results.push({ target: t.name, hpBefore: before, hpAfter: after, healed: after - before, via: 'heal', error });
       }
-      return { success: true, attacker: attTok.name, item: item.name, results };
+      await consumeSlot();
+    return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
     // ---- BUFF / UTILITY (Bless, etc.): apply the spell's active effect(s) to the targets. ----
@@ -2225,7 +2238,8 @@ export class QueryHandlers {
         } catch (e) { /* ignore */ }
         results.push({ target: t.name, effectsApplied: applied, via: 'buff' });
       }
-      return { success: true, attacker: attTok.name, item: item.name, results };
+      await consumeSlot();
+    return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
     // ---- ATTACK-ROLL actions (weapons + spell attacks): Midi's use() no-ops headless. ----
@@ -2261,7 +2275,8 @@ export class QueryHandlers {
         results.push({ target: t.name, hpBefore, hpAfter, damage: hpBefore - hpAfter,
           hit, crit, fumble, attackTotal, damageRolled: damage, damageType, targetAC: AC, via: 'attack', error });
       }
-      return { success: true, attacker: attTok.name, item: item.name, results };
+      await consumeSlot();
+    return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
     // ---- SAVE / other (Sacred Flame, Fireball): Midi resolves the save + half/none damage. ----
@@ -2274,11 +2289,13 @@ export class QueryHandlers {
         { configure: false }, {}
       );
     } catch (e) { /* swallow late headless UI throw */ }
-    await new Promise((r) => setTimeout(r, 1200));
+    for (let w = 0; w < 7; w++) { await new Promise((r) => setTimeout(r, 300));
+      if (targetToks.some((t: any, i: number) => (t.actor?.system?.attributes?.hp?.value) !== before[i].hp)) break; }
     for (let i = 0; i < targetToks.length; i++) {
       const t = targetToks[i]; const hpAfter = t.actor?.system?.attributes?.hp?.value;
       results.push({ target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0), via: 'save' });
     }
+    await consumeSlot();
     return { success: true, attacker: attTok.name, item: item.name, results };
   }
 
