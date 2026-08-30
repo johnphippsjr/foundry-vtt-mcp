@@ -2178,74 +2178,106 @@ export class QueryHandlers {
     const activities = [...((item.system.activities as any) || [])];
     const activity = activities.find((a: any) => a.type === 'attack') || activities[0];
     if (!activity) throw new Error('No usable activity on item: ' + data.item);
-    const targetToks = (data.targets || []).map((r: string) => this._findToken(scene, r)).filter(Boolean);
+
+    const isAttack = activity.type === 'attack' || !!(activity as any).attack;
+    const isHeal = activity.type === 'heal';
+    const spellEffects = [...((item.effects as any) || [])].filter((e: any) => !e.transfer);
+    const isSave = activity.type === 'save' || !!(activity as any).save;
+    const isBuff = !isAttack && !isHeal && !isSave && (activity.type === 'utility' || spellEffects.length > 0);
+
+    let targetToks = (data.targets || []).map((r: string) => this._findToken(scene, r)).filter(Boolean);
+    // Heals and buffs default to the caster (self) when no target is named ("I cast Bless").
+    if (!targetToks.length && (isHeal || isBuff)) targetToks = [attTok];
     if (!targetToks.length) throw new Error('No valid targets');
     const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
     attTok.object?.control({ releaseOthers: true });
-    const isAttack = activity.type === 'attack' || !!(activity as any).attack;
     const results: any[] = [];
 
-    if (!isAttack) {
-      // SAVE / non-attack (e.g. Sacred Flame): Midi's workflow rolls the target's save, applies
-      // half/none/full correctly, and writes HP. That path works headless, so use it as-is.
-      targetToks.forEach((t: any) => t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false }));
-      const before = targetToks.map((t: any) => ({ hp: t.actor?.system?.attributes?.hp?.value }));
+    // ---- HEAL (Cure Wounds, Healing Word): Midi's cast no-ops headless, so roll + apply HP. ----
+    if (isHeal) {
+      let healed = 0, error: string | null = null;
       try {
-        await MidiQOL.completeActivityUse(
-          activity,
-          { midiOptions: { targetsToUse: new Set(targetObjs), autoRollAttack: true, autoRollDamage: 'always', fastForwardAttack: true, fastForwardDamage: true } },
-          { configure: false }, {}
-        );
-      } catch (e) { /* swallow late headless UI throw; HP application already happened */ }
-      await new Promise((r) => setTimeout(r, 1200));
-      for (let i = 0; i < targetToks.length; i++) {
-        const t = targetToks[i]; const hpAfter = t.actor?.system?.attributes?.hp?.value;
-        results.push({ target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0), via: 'save' });
+        const dr = await (activity as any).rollDamage({}, { configure: false }, {});
+        const rolls = Array.isArray(dr) ? dr : [dr];
+        healed = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
+      } catch (e: any) { error = String((e && (e.message)) || e); }
+      for (const t of targetToks) {
+        const hp = t.actor?.system?.attributes?.hp;
+        const before = hp?.value ?? 0, max = hp?.max ?? before;
+        const after = Math.min(max, before + healed);
+        if (after !== before) await t.actor.update({ 'system.attributes.hp.value': after });
+        results.push({ target: t.name, hpBefore: before, hpAfter: after, healed: after - before, via: 'heal', error });
       }
       return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
-    // ATTACK-ROLL actions (weapons AND spell attacks like Guiding Bolt): Midi's full use()/
-    // completeActivityUse silently no-ops in the headless GM browser (no workflow, no HP change).
-    // The lower-level roll primitives DO work, so resolve the attack ourselves: roll vs the
-    // target's AC, roll damage on a hit, and apply it. Deterministic and headless-safe.
-    for (const t of targetToks) {
-      const AC = t.actor?.system?.attributes?.ac?.value ?? 10;
-      const hpBefore = t.actor?.system?.attributes?.hp?.value ?? 0;
-      t.object?.setTarget(true, { user: (game as any).user, releaseOthers: true });
-      let attackTotal: number | null = null, crit = false, fumble = false, hit = false;
-      let damage = 0, damageType: string | null = null, hpAfter = hpBefore, error: string | null = null;
-      try {
-        const ar = await (activity as any).rollAttack({}, { configure: false }, {});
-        const aroll = Array.isArray(ar) ? ar[0] : ar;
-        attackTotal = aroll?.total ?? null; crit = !!aroll?.isCritical; fumble = !!aroll?.isFumble;
-        hit = crit || (!fumble && attackTotal != null && attackTotal >= AC);
-        if (hit) {
-          const dr = await (activity as any).rollDamage({}, { configure: false }, {});
-          const rolls = Array.isArray(dr) ? dr : [dr];
-          damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
-          damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
-          // 5e critical hit: roll the damage DICE again and add (flat modifiers are NOT doubled).
-          // dnd5e's decoupled rollDamage does not double base dice on its own headless.
-          if (crit) {
-            const RollCls: any = (globalThis as any).foundry?.dice?.Roll || (globalThis as any).Roll;
-            for (const r of rolls) {
-              for (const term of ((r && r.terms) || [])) {
+    // ---- BUFF / UTILITY (Bless, etc.): apply the spell's active effect(s) to the targets. ----
+    if (isBuff) {
+      const aes = spellEffects.map((e: any) => { const o = e.toObject(); o.origin = item.uuid; o.disabled = false; delete o._id; return o; });
+      for (const t of targetToks) {
+        let applied: string[] = [];
+        try {
+          // avoid stacking the same-named effect on recast
+          const dupes = (t.actor.effects || []).filter((e: any) => aes.some((n: any) => n.name === e.name)).map((e: any) => e.id);
+          if (dupes.length) await t.actor.deleteEmbeddedDocuments('ActiveEffect', dupes);
+          const created = await t.actor.createEmbeddedDocuments('ActiveEffect', aes);
+          applied = created.map((x: any) => x.name);
+        } catch (e) { /* ignore */ }
+        results.push({ target: t.name, effectsApplied: applied, via: 'buff' });
+      }
+      return { success: true, attacker: attTok.name, item: item.name, results };
+    }
+
+    // ---- ATTACK-ROLL actions (weapons + spell attacks): Midi's use() no-ops headless. ----
+    if (isAttack) {
+      for (const t of targetToks) {
+        const AC = t.actor?.system?.attributes?.ac?.value ?? 10;
+        const hpBefore = t.actor?.system?.attributes?.hp?.value ?? 0;
+        t.object?.setTarget(true, { user: (game as any).user, releaseOthers: true });
+        let attackTotal: number | null = null, crit = false, fumble = false, hit = false;
+        let damage = 0, damageType: string | null = null, hpAfter = hpBefore, error: string | null = null;
+        try {
+          const ar = await (activity as any).rollAttack({}, { configure: false }, {});
+          const aroll = Array.isArray(ar) ? ar[0] : ar;
+          attackTotal = aroll?.total ?? null; crit = !!aroll?.isCritical; fumble = !!aroll?.isFumble;
+          hit = crit || (!fumble && attackTotal != null && attackTotal >= AC);
+          if (hit) {
+            const dr = await (activity as any).rollDamage({}, { configure: false }, {});
+            const rolls = Array.isArray(dr) ? dr : [dr];
+            damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
+            damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
+            if (crit) {
+              const RollCls: any = (globalThis as any).foundry?.dice?.Roll || (globalThis as any).Roll;
+              for (const r of rolls) for (const term of ((r && r.terms) || [])) {
                 if (term && term.faces && term.number) {
                   try { const er = new RollCls(`${term.number}d${term.faces}`); await er.evaluate(); damage += er.total; } catch (e) { /* ignore */ }
                 }
               }
             }
+            await t.actor.applyDamage([{ value: damage, type: damageType }]);
+            hpAfter = t.actor?.system?.attributes?.hp?.value ?? hpBefore;
           }
-          await t.actor.applyDamage([{ value: damage, type: damageType }]);
-          hpAfter = t.actor?.system?.attributes?.hp?.value ?? hpBefore;
-        }
-      } catch (e: any) { error = String((e && (e.stack || e.message)) || e); }
-      results.push({
-        target: t.name, hpBefore, hpAfter, damage: hpBefore - hpAfter,
-        hit, crit, fumble, attackTotal, damageRolled: damage, damageType, targetAC: AC,
-        via: 'attack', error,
-      });
+        } catch (e: any) { error = String((e && (e.stack || e.message)) || e); }
+        results.push({ target: t.name, hpBefore, hpAfter, damage: hpBefore - hpAfter,
+          hit, crit, fumble, attackTotal, damageRolled: damage, damageType, targetAC: AC, via: 'attack', error });
+      }
+      return { success: true, attacker: attTok.name, item: item.name, results };
+    }
+
+    // ---- SAVE / other (Sacred Flame, Fireball): Midi resolves the save + half/none damage. ----
+    targetToks.forEach((t: any) => t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false }));
+    const before = targetToks.map((t: any) => ({ hp: t.actor?.system?.attributes?.hp?.value }));
+    try {
+      await MidiQOL.completeActivityUse(
+        activity,
+        { midiOptions: { targetsToUse: new Set(targetObjs), autoRollAttack: true, autoRollDamage: 'always', fastForwardAttack: true, fastForwardDamage: true } },
+        { configure: false }, {}
+      );
+    } catch (e) { /* swallow late headless UI throw */ }
+    await new Promise((r) => setTimeout(r, 1200));
+    for (let i = 0; i < targetToks.length; i++) {
+      const t = targetToks[i]; const hpAfter = t.actor?.system?.attributes?.hp?.value;
+      results.push({ target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0), via: 'save' });
     }
     return { success: true, attacker: attTok.name, item: item.name, results };
   }
