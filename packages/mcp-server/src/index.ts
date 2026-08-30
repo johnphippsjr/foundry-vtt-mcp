@@ -370,9 +370,31 @@ async function startWrapper() {
     }
   });
 
-  const transport = new StdioServerTransport();
-
-  await mcp.connect(transport);
+  // Brain-facing transport. In the cluster we expose a small HTTP tool API
+  // (MCP_HTTP_PORT) that the DM brain (FastAPI) calls; falls back to stdio
+  // (Claude Desktop) when MCP_HTTP_PORT is not set.
+  if (process.env.MCP_HTTP_PORT) {
+    const httpMod = await import('http');
+    const port = parseInt(process.env.MCP_HTTP_PORT, 10);
+    const srv = httpMod.createServer(async (req, res) => {
+      const json = (code: number, obj: any) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      try {
+        if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/')) return json(200, { status: 'ok', service: config.server.name });
+        if (req.method === 'GET' && req.url === '/tools') { const r = await backend.send('list_tools', {}); return json(200, { tools: r.tools || [] }); }
+        if (req.method === 'POST' && (req.url === '/tools/call' || req.url === '/call')) {
+          let body = ''; for await (const c of req) body += c;
+          const parsed = body ? JSON.parse(body) : {};
+          const r = await backend.send('call_tool', { name: parsed.name, args: parsed.args ?? parsed.arguments ?? {} });
+          return json(200, r);
+        }
+        return json(404, { error: 'not found' });
+      } catch (e: any) { return json(500, { error: e?.message || String(e) }); }
+    });
+    srv.listen(port, '0.0.0.0', () => { try { (backend as any).log?.('HTTP tool API listening on 0.0.0.0:' + port); } catch {} console.error('[foundry-mcp] HTTP tool API on 0.0.0.0:' + port); });
+  } else {
+    const transport = new StdioServerTransport();
+    await mcp.connect(transport);
+  }
 }
 
 startWrapper().catch(err => {

@@ -1,0 +1,12 @@
+FROM node:20-slim
+WORKDIR /app
+# built repo (dist + hoisted node_modules) copied in; ComfyUI intentionally absent (map-gen
+# tools inert for v1 — auto-start is non-fatal). Brain talks HTTP (MCP_HTTP_PORT); the Foundry
+# module connects to the WS server on 31415.
+COPY . .
+ENV MCP_HTTP_PORT=3000 \
+    LOG_LEVEL=info \
+    ENABLE_FILE_LOGGING=false \
+    FOUNDRY_CONNECTION_TYPE=websocket
+EXPOSE 3000 31415
+CMD ["node","packages/mcp-server/dist/index.js"]
