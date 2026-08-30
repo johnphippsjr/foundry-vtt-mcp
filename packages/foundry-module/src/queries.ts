@@ -49,6 +49,11 @@ export class QueryHandlers {
 
     // Utility queries
     CONFIG.queries[`${modulePrefix}.ping`] = this.handlePing.bind(this);
+    CONFIG.queries[`${modulePrefix}.startCombat`] = this.handleStartCombat.bind(this);
+    CONFIG.queries[`${modulePrefix}.endCombat`] = this.handleEndCombat.bind(this);
+    CONFIG.queries[`${modulePrefix}.nextTurn`] = this.handleNextTurn.bind(this);
+    CONFIG.queries[`${modulePrefix}.getCombatState`] = this.handleGetCombatState.bind(this);
+    CONFIG.queries[`${modulePrefix}.executeAttack`] = this.handleExecuteAttack.bind(this);
 
     // Phase 2 & 3: Write operation queries
     CONFIG.queries[`${modulePrefix}.createActorFromCompendium`] =
@@ -2091,4 +2096,90 @@ export class QueryHandlers {
     this.dataAccess.validateFoundryState();
     return this.dataAccess.deleteActorItems(data.actorIdentifier, data.itemIds);
   }
+
+  // ---- Combat tools (Phase 1, Step 8). LLM decides intent; Midi-QOL does the 5e math. ----
+  private _activeScene(): any {
+    const scene = (game as any).scenes?.active || (game as any).scenes?.contents?.[0];
+    if (!scene) throw new Error('No active scene');
+    return scene;
+  }
+  private _findToken(scene: any, ref: string): any {
+    const byId = scene.tokens.get(ref);
+    if (byId) return byId;
+    const lower = String(ref).toLowerCase();
+    return scene.tokens.find((t: any) => t.name?.toLowerCase() === lower);
+  }
+  private async handleStartCombat(data: { tokens?: string[] }): Promise<any> {
+    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const scene = this._activeScene();
+    let combat = (game as any).combat;
+    if (!combat) combat = await (game as any).combats.documentClass.create({ scene: scene.id, active: true });
+    const toks = (data.tokens && data.tokens.length)
+      ? data.tokens.map((r: string) => this._findToken(scene, r)).filter(Boolean)
+      : scene.tokens.contents;
+    const toAdd = toks.filter((t: any) => !combat.combatants.find((c: any) => c.tokenId === t.id))
+      .map((t: any) => ({ tokenId: t.id, sceneId: scene.id, actorId: t.actorId }));
+    if (toAdd.length) await combat.createEmbeddedDocuments('Combatant', toAdd);
+    await combat.rollAll();
+    if (!combat.started) await combat.startCombat();
+    return { success: true, round: combat.round, combatants: combat.turns.map((c: any) => ({ name: c.name, initiative: c.initiative })) };
+  }
+  private async handleEndCombat(): Promise<any> {
+    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const combat = (game as any).combat;
+    if (!combat) return { success: true, note: 'no active combat' };
+    await combat.delete();
+    return { success: true };
+  }
+  private async handleNextTurn(): Promise<any> {
+    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const combat = (game as any).combat;
+    if (!combat) throw new Error('No active combat');
+    await combat.nextTurn();
+    return { success: true, round: combat.round, turn: combat.turn, current: combat.combatant ? combat.combatant.name : null };
+  }
+  private async handleGetCombatState(): Promise<any> {
+    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const combat = (game as any).combat;
+    if (!combat) return { active: false };
+    return {
+      active: true, round: combat.round, turn: combat.turn,
+      current: combat.combatant ? combat.combatant.name : null,
+      order: combat.turns.map((c: any) => ({
+        name: c.name, initiative: c.initiative,
+        hp: c.actor?.system?.attributes?.hp?.value, maxHp: c.actor?.system?.attributes?.hp?.max,
+        defeated: c.isDefeated,
+      })),
+    };
+  }
+  private async handleExecuteAttack(data: { attacker: string; item: string; targets: string[] }): Promise<any> {
+    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const MidiQOL = (globalThis as any).MidiQOL;
+    if (!MidiQOL) throw new Error('MidiQOL not available');
+    const scene = this._activeScene();
+    const attTok = this._findToken(scene, data.attacker);
+    if (!attTok) throw new Error('Attacker token not found: ' + data.attacker);
+    const actor = attTok.actor; if (!actor) throw new Error('Attacker has no actor');
+    const itemLower = String(data.item).toLowerCase();
+    const item = actor.items.find((i: any) => i.name?.toLowerCase() === itemLower && i.system?.activities?.size)
+      || actor.items.find((i: any) => i.name?.toLowerCase() === itemLower);
+    if (!item) throw new Error('Item not found on attacker: ' + data.item);
+    const activities = [...((item.system.activities as any) || [])];
+    const activity = activities.find((a: any) => a.type === 'attack') || activities[0];
+    if (!activity) throw new Error('No usable activity on item: ' + data.item);
+    const targetToks = (data.targets || []).map((r: string) => this._findToken(scene, r)).filter(Boolean);
+    if (!targetToks.length) throw new Error('No valid targets');
+    const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
+    attTok.object?.control({ releaseOthers: true });
+    targetToks.forEach((t: any) => t.object?.setTarget(true, { user: game.user, releaseOthers: false }));
+    const before = targetToks.map((t: any) => ({ name: t.name, hp: t.actor?.system?.attributes?.hp?.value }));
+    await MidiQOL.completeActivityUse(activity, { midiOptions: { targetsToUse: new Set(targetObjs), autoRollAttack: true, autoRollDamage: 'always', fastForwardAttack: true, fastForwardDamage: true } }, { configure: false }, {});
+    await new Promise((r) => setTimeout(r, 1500));
+    const results = targetToks.map((t: any, i: number) => {
+      const hpAfter = t.actor?.system?.attributes?.hp?.value;
+      return { target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0) };
+    });
+    return { success: true, attacker: attTok.name, item: item.name, results };
+  }
+
 }

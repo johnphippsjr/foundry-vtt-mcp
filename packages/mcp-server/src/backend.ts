@@ -28,6 +28,7 @@ import { ActorManagementTools } from './tools/actor-management.js';
 import { QuestCreationTools } from './tools/quest-creation.js';
 
 import { DiceRollTools } from './tools/dice-roll.js';
+import { CombatTools } from './tools/dnd5e/combat.js';
 
 import { CampaignManagementTools } from './tools/campaign-management.js';
 
@@ -1207,6 +1208,7 @@ async function startBackend(): Promise<void> {
   const questCreationTools = new QuestCreationTools({ foundryClient, logger });
 
   const diceRollTools = new DiceRollTools({ foundryClient, logger });
+  const combatTools = new CombatTools({ foundryClient, logger });
 
   const campaignManagementTools = new CampaignManagementTools(foundryClient, logger);
 
@@ -1432,6 +1434,7 @@ async function startBackend(): Promise<void> {
     ...questCreationTools.getToolDefinitions(),
 
     ...diceRollTools.getToolDefinitions(),
+    ...combatTools.getToolDefinitions(),
 
     ...campaignManagementTools.getToolDefinitions(),
 
@@ -1509,6 +1512,22 @@ async function startBackend(): Promise<void> {
               let result: any;
 
               switch (name) {
+                // Combat tools (Phase 1)
+                case 'start-combat':
+                  result = await combatTools.handleStartCombat(args);
+                  break;
+                case 'end-combat':
+                  result = await combatTools.handleEndCombat(args);
+                  break;
+                case 'next-turn':
+                  result = await combatTools.handleNextTurn(args);
+                  break;
+                case 'get-combat-state':
+                  result = await combatTools.handleGetCombatState(args);
+                  break;
+                case 'execute-attack':
+                  result = await combatTools.handleExecuteAttack(args);
+                  break;
                 // Character tools
 
                 case 'get-character':
