@@ -2199,9 +2199,45 @@ export class QueryHandlers {
     // Heals and buffs default to the caster (self) when no target is named ("I cast Bless").
     if (!targetToks.length && (isHeal || isBuff)) targetToks = [attTok];
     if (!targetToks.length) throw new Error('No valid targets');
+    const results: any[] = [];
+    // ============ ENGINE RULE GATE: let Foundry/Midi-QOL decide legality ============
+    // The DM/LLM cannot bypass rules. Midi's own checkActivityRange enforces the item's range/reach
+    // AND any feats/effects that modify it (e.g. Spell Sniper doubling range); canSee enforces line
+    // of sight (walls). Melee that is out of reach walks into reach first (5e move+attack).
+    {
+      const _M: any = (globalThis as any).MidiQOL;
+      const _rng: any = (item.system.range || {});
+      const _isSelfSpell = _rng.units === 'self';
+      const _isRangedWeapon = item.type === 'weapon' && (_rng.value || 0) > 5;
+      const _needsAdjacent = (item.type === 'weapon' && !_isRangedWeapon) || _rng.units === 'touch';
+      const _gs = (scene.grid?.size) || 100; const _G = (v: number) => Math.round(v / _gs);
+      const _inRange = (tgt: any) => { try { const rr = _M?.checkActivityRange(activity, attTok.object, new Set([tgt.object]), false); return !rr || rr.result !== 'fail'; } catch (e) { return true; } };
+      const _dist = (tgt: any) => { try { return _M?.computeDistance(attTok.object, tgt.object, { wallsBlock: false }); } catch (e) { return -1; } };
+      const _canSee = (tgt: any) => { try { return _M?.canSee ? _M.canSee(attTok.object, tgt.object) : true; } catch (e) { return true; } };
+      const _valid: any[] = [];
+      for (const t of targetToks) {
+        const _isSelf = t.id === attTok.id;
+        if (_isSelfSpell && !_isSelf) { results.push({ target: t.name, hit: false, error: item.name + ' can only affect the caster' }); continue; }
+        if (_isSelf) { _valid.push(t); continue; }
+        if (!_canSee(t)) { results.push({ target: t.name, hit: false, outOfSight: true, note: 'no line of sight to ' + t.name }); continue; }
+        if (!_inRange(t)) {
+          if (_needsAdjacent) {
+            const _spd = attTok.actor?.system?.attributes?.movement?.walk || 30; const _gridSpeed = Math.max(0, Math.floor(_spd / 5));
+            let _cx = _G(attTok.x), _cy = _G(attTok.y); const _tx = _G(t.x), _ty = _G(t.y); let _steps = 0;
+            while (_steps < _gridSpeed && Math.max(Math.abs(_cx - _tx), Math.abs(_cy - _ty)) > 1) { if (_cx < _tx) _cx++; else if (_cx > _tx) _cx--; if (_cy < _ty) _cy++; else if (_cy > _ty) _cy--; _steps++; }
+            if (_steps > 0) { await attTok.update({ x: _cx * _gs, y: _cy * _gs }); await new Promise((r) => setTimeout(r, 400)); }
+            if (!_inRange(t)) { results.push({ target: t.name, hit: false, outOfReach: true, movedFeet: _steps * 5, note: 'moved ' + (_steps * 5) + 'ft but ' + t.name + ' is still out of reach' }); continue; }
+          } else {
+            const _df = _dist(t); results.push({ target: t.name, hit: false, outOfRange: true, note: t.name + ' is ' + (_df >= 0 ? _df + 'ft' : 'too far') + ' away, beyond the range of ' + item.name }); continue;
+          }
+        }
+        _valid.push(t);
+      }
+      targetToks = _valid;
+    }
+    if (!targetToks.length) return { success: false, attacker: attTok.name, item: item.name, results, refused: true };
     const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
     attTok.object?.control({ releaseOthers: true });
-    const results: any[] = [];
 
     // ---- HEAL (Cure Wounds, Healing Word): Midi's cast no-ops headless, so roll + apply HP. ----
     if (isHeal) {
