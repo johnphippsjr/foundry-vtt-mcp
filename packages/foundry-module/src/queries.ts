@@ -49,6 +49,12 @@ export class QueryHandlers {
       this.handleListInstalledPackages.bind(this);
     CONFIG.queries[`${modulePrefix}.adventure-import`] = this.handleAdventureImport.bind(this);
 
+    // Phase D user provisioning queries (join flow; PLAYER/TRUSTED only, never ASSISTANT/GM)
+    CONFIG.queries[`${modulePrefix}.user-create`] = this.handleUserCreate.bind(this);
+    CONFIG.queries[`${modulePrefix}.user-update`] = this.handleUserUpdate.bind(this);
+    CONFIG.queries[`${modulePrefix}.list-users`] = this.handleListUsers.bind(this);
+    CONFIG.queries[`${modulePrefix}.user-delete`] = this.handleUserDelete.bind(this);
+
     // World queries
     CONFIG.queries[`${modulePrefix}.getWorldInfo`] = this.handleGetWorldInfo.bind(this);
 
@@ -2806,6 +2812,183 @@ export class QueryHandlers {
       }
 
       throw new Error(`Unrecognized scene_ref shape: "${data.scene_ref}"`);
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  // ---- Phase D user provisioning tools (join flow; Section 4f audit gap). ----
+  // Deliberately PLAYER(1)/TRUSTED(2) ONLY: these exist so the brain's join flow can seat a
+  // player, never to hand out ASSISTANT(3) or GAMEMASTER(4) accounts. Every entry point below
+  // (create, and the role gate itself) refuses role 0/3/4 with a clear error.
+  private static readonly ROLE_NAMES: Record<number, string> = {
+    0: 'NONE',
+    1: 'PLAYER',
+    2: 'TRUSTED',
+    3: 'ASSISTANT',
+    4: 'GAMEMASTER',
+  };
+
+  private _resolveJoinRole(role: any): { ok: true; value: number } | { ok: false; error: string } {
+    const ALLOWED: Record<string, number> = { PLAYER: 1, TRUSTED: 2 };
+    let num: number | undefined;
+    if (typeof role === 'number' && Number.isFinite(role)) {
+      num = role;
+    } else if (typeof role === 'string') {
+      const upper = role.trim().toUpperCase();
+      if (upper in ALLOWED) {
+        num = ALLOWED[upper];
+      } else if (/^-?\d+$/.test(upper)) {
+        num = parseInt(upper, 10);
+      }
+    }
+    if (num === undefined || (num !== 1 && num !== 2)) {
+      const label =
+        num !== undefined ? QueryHandlers.ROLE_NAMES[num] || `role ${num}` : JSON.stringify(role);
+      return {
+        ok: false,
+        error: `role must be PLAYER(1) or TRUSTED(2); refusing ${label}. This tool cannot create ASSISTANT(3) or GAMEMASTER(4) accounts.`,
+      };
+    }
+    return { ok: true, value: num };
+  }
+
+  private async handleUserCreate(data: {
+    name?: string;
+    password?: string;
+    role?: string | number;
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.name || typeof data.name !== 'string' || !data.name.trim()) {
+        throw new Error('name is required');
+      }
+      if (!data.password || typeof data.password !== 'string' || !data.password.length) {
+        throw new Error('password is required');
+      }
+      const roleCheck = this._resolveJoinRole(data.role);
+      if (!roleCheck.ok) return { success: false, error: roleCheck.error };
+
+      const UserCls: any = (globalThis as any).User;
+      if (!UserCls || typeof UserCls.create !== 'function') {
+        return {
+          success: false,
+          error: 'User document class unavailable in this Foundry build (capability check failed)',
+        };
+      }
+
+      let created: any;
+      try {
+        // Create with role only, matching core's own "Manage Players" flow (the Create User
+        // button never takes a password); the password is set in a second call below via the
+        // same user.update({password}) path the "Configure Player" sheet uses, which is the
+        // well-established GM-sets-another-user's-password mechanism (server-side hashing on
+        // receipt). This is safer than betting on Create() also accepting a raw password field,
+        // which is not documented and untested here.
+        created = await UserCls.create({ name: data.name.trim(), role: roleCheck.value });
+      } catch (coreErr: any) {
+        return {
+          success: false,
+          error: `Foundry refused to create the user: ${String((coreErr && (coreErr.message || coreErr)) || coreErr)}`,
+        };
+      }
+      if (!created) {
+        return {
+          success: false,
+          error: 'User.create returned no document (refused silently by core)',
+        };
+      }
+
+      try {
+        await created.update({ password: data.password });
+      } catch (pwErr: any) {
+        // The user document now exists but without the intended password; say so plainly rather
+        // than reporting a clean success the caller would trust.
+        return {
+          success: false,
+          error: `User "${created.name}" (${created.id}) was created but setting its password failed: ${String((pwErr && (pwErr.message || pwErr)) || pwErr)}. Delete it with user-delete and retry, or set the password by hand.`,
+          id: created.id,
+          name: created.name,
+        };
+      }
+
+      return { success: true, id: created.id, name: created.name };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleUserUpdate(data: {
+    id?: string;
+    password?: string;
+    character_id?: string | null;
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.id) throw new Error('id is required');
+      const user: any = (game as any).users?.get(data.id);
+      if (!user) throw new Error(`User not found: ${data.id}`);
+
+      const update: any = {};
+      if (data.password !== undefined && data.password !== null && String(data.password).length) {
+        update.password = data.password;
+      }
+      if (data.character_id !== undefined) {
+        if (data.character_id === null || data.character_id === '') {
+          update.character = null;
+        } else {
+          const actor: any = (game as any).actors?.get(data.character_id);
+          if (!actor) throw new Error(`Actor not found: ${data.character_id}`);
+          update.character = actor.id;
+        }
+      }
+      if (Object.keys(update).length === 0) {
+        throw new Error('No fields to update: provide password and/or character_id');
+      }
+
+      await user.update(update);
+      return { success: true, id: user.id };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleListUsers(_data: any): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      const users: any[] = (game as any).users?.contents || [];
+      const list = users.map((u: any) => ({
+        id: u.id,
+        name: u.name,
+        role: u.role,
+        roleName: QueryHandlers.ROLE_NAMES[u.role] || 'UNKNOWN',
+        active: !!u.active,
+        character_id: u.character?.id || null,
+      }));
+      return { success: true, users: list };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e), users: [] };
+    }
+  }
+
+  private async handleUserDelete(data: { id?: string }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.id) throw new Error('id is required');
+      const user: any = (game as any).users?.get(data.id);
+      if (!user) throw new Error(`User not found: ${data.id}`);
+      if (user.role >= 4) {
+        return {
+          success: false,
+          error: 'Refusing to delete a GAMEMASTER-role user through this tool.',
+        };
+      }
+      await user.delete();
+      return { success: true, id: data.id };
     } catch (e: any) {
       return { success: false, error: String((e && (e.stack || e.message)) || e) };
     }

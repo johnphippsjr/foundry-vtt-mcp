@@ -22,6 +22,7 @@ import { CompendiumTools } from './tools/compendium.js';
 
 import { SceneTools } from './tools/scene.js';
 import { SceneManagementTools } from './tools/scene-management.js';
+import { UserManagementTools } from './tools/user-management.js';
 
 import { ActorCreationTools } from './tools/actor-creation.js';
 import { ActorManagementTools } from './tools/actor-management.js';
@@ -1194,6 +1195,7 @@ async function startBackend(): Promise<void> {
 
   const sceneTools = new SceneTools({ foundryClient, logger });
   const sceneManagementTools = new SceneManagementTools({ foundryClient, logger });
+  const userManagementTools = new UserManagementTools({ foundryClient, logger });
 
   const actorCreationTools = new ActorCreationTools({ foundryClient, logger });
   const actorManagementTools = new ActorManagementTools({ foundryClient, logger, systemRegistry });
@@ -1424,6 +1426,7 @@ async function startBackend(): Promise<void> {
 
     ...sceneTools.getToolDefinitions(),
     ...sceneManagementTools.getToolDefinitions(),
+    ...userManagementTools.getToolDefinitions(),
 
     ...actorCreationTools.getToolDefinitions(),
     ...actorManagementTools.getToolDefinitions(),
@@ -1798,6 +1801,26 @@ async function startBackend(): Promise<void> {
 
                 case 'adventure-import':
                   result = await sceneManagementTools.handleAdventureImport(args);
+
+                  break;
+
+                case 'user-create':
+                  result = await userManagementTools.handleUserCreate(args);
+
+                  break;
+
+                case 'user-update':
+                  result = await userManagementTools.handleUserUpdate(args);
+
+                  break;
+
+                case 'list-users':
+                  result = await userManagementTools.handleListUsers(args);
+
+                  break;
+
+                case 'user-delete':
+                  result = await userManagementTools.handleUserDelete(args);
 
                   break;
 
