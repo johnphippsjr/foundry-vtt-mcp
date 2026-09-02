@@ -43,6 +43,11 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.getActiveScene`] = this.handleGetActiveScene.bind(this);
     CONFIG.queries[`${modulePrefix}.list-scenes`] = this.handleListScenes.bind(this);
     CONFIG.queries[`${modulePrefix}.switch-scene`] = this.handleSwitchScene.bind(this);
+    CONFIG.queries[`${modulePrefix}.scene-create`] = this.handleSceneCreate.bind(this);
+    CONFIG.queries[`${modulePrefix}.scene-update`] = this.handleSceneUpdate.bind(this);
+    CONFIG.queries[`${modulePrefix}.list-installed-packages`] =
+      this.handleListInstalledPackages.bind(this);
+    CONFIG.queries[`${modulePrefix}.adventure-import`] = this.handleAdventureImport.bind(this);
 
     // World queries
     CONFIG.queries[`${modulePrefix}.getWorldInfo`] = this.handleGetWorldInfo.bind(this);
@@ -386,11 +391,43 @@ export class QueryHandlers {
       }
 
       this.dataAccess.validateFoundryState();
-      return await this.dataAccess.getActiveScene();
+      const sceneData = await this.dataAccess.getActiveScene();
+      return this._withGridAndFlags(sceneData);
     } catch (error) {
       throw new Error(
         `Failed to get active scene: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
+    }
+  }
+
+  // ---- Phase B board-prep additions: grid detail + flags on scene reads (Section 4f audit gap). ----
+  // Additive only: existing fields (e.g. list-scenes' gridSize) are untouched; this merges in a
+  // richer "grid" object and the scene's "flags" (report-card + B5 idempotency read theirs from
+  // flags.aidm.pipeline) without changing any previously-shipped field's shape or meaning.
+  private _withGridAndFlags(sceneData: any): any {
+    if (!sceneData || !sceneData.id) return sceneData;
+    try {
+      const scene: any = (game as any).scenes?.get(sceneData.id);
+      if (!scene) return sceneData;
+      const g = scene.grid || {};
+      let flags: any = {};
+      try {
+        flags = JSON.parse(JSON.stringify(scene.flags || {}));
+      } catch (e) {
+        flags = {};
+      }
+      return {
+        ...sceneData,
+        grid: {
+          type: g.type,
+          size: g.size,
+          offsetX: g.offsetX ?? 0,
+          offsetY: g.offsetY ?? 0,
+        },
+        flags,
+      };
+    } catch (e) {
+      return sceneData;
     }
   }
 
@@ -1048,7 +1085,8 @@ export class QueryHandlers {
       }
 
       this.dataAccess.validateFoundryState();
-      return await this.dataAccess.listScenes(data);
+      const scenes = await this.dataAccess.listScenes(data);
+      return (Array.isArray(scenes) ? scenes : []).map((s: any) => this._withGridAndFlags(s));
     } catch (error) {
       throw new Error(
         `Failed to list scenes: ${error instanceof Error ? error.message : 'Unknown error'}`
@@ -2111,91 +2149,142 @@ export class QueryHandlers {
     return scene.tokens.find((t: any) => t.name?.toLowerCase() === lower);
   }
   private async handleStartCombat(data: { tokens?: string[] }): Promise<any> {
-    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
     const scene = this._activeScene();
     let combat = (game as any).combat;
-    if (!combat) combat = await (game as any).combats.documentClass.create({ scene: scene.id, active: true });
-    const toks = (data.tokens && data.tokens.length)
-      ? data.tokens.map((r: string) => this._findToken(scene, r)).filter(Boolean)
-      : scene.tokens.contents;
-    const toAdd = toks.filter((t: any) => !combat.combatants.find((c: any) => c.tokenId === t.id))
+    if (!combat)
+      combat = await (game as any).combats.documentClass.create({ scene: scene.id, active: true });
+    const toks =
+      data.tokens && data.tokens.length
+        ? data.tokens.map((r: string) => this._findToken(scene, r)).filter(Boolean)
+        : scene.tokens.contents;
+    const toAdd = toks
+      .filter((t: any) => !combat.combatants.find((c: any) => c.tokenId === t.id))
       .map((t: any) => ({ tokenId: t.id, sceneId: scene.id, actorId: t.actorId }));
     if (toAdd.length) await combat.createEmbeddedDocuments('Combatant', toAdd);
     await combat.rollAll();
     if (!combat.started) await combat.startCombat();
-    return { success: true, round: combat.round, combatants: combat.turns.map((c: any) => ({ name: c.name, initiative: c.initiative })) };
+    return {
+      success: true,
+      round: combat.round,
+      combatants: combat.turns.map((c: any) => ({ name: c.name, initiative: c.initiative })),
+    };
   }
   private async handleEndCombat(): Promise<any> {
-    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
     const combat = (game as any).combat;
     if (!combat) return { success: true, note: 'no active combat' };
     await combat.delete();
     return { success: true };
   }
   private async handleNextTurn(): Promise<any> {
-    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
     const combat = (game as any).combat;
     if (!combat) throw new Error('No active combat');
     await combat.nextTurn();
-    return { success: true, round: combat.round, turn: combat.turn, current: combat.combatant ? combat.combatant.name : null };
+    return {
+      success: true,
+      round: combat.round,
+      turn: combat.turn,
+      current: combat.combatant ? combat.combatant.name : null,
+    };
   }
   private async handleGetCombatState(): Promise<any> {
-    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
     const combat = (game as any).combat;
     if (!combat) return { active: false };
     return {
-      active: true, round: combat.round, turn: combat.turn,
+      active: true,
+      round: combat.round,
+      turn: combat.turn,
       current: combat.combatant ? combat.combatant.name : null,
       order: combat.turns.map((c: any) => ({
-        name: c.name, initiative: c.initiative,
-        hp: c.actor?.system?.attributes?.hp?.value, maxHp: c.actor?.system?.attributes?.hp?.max,
+        name: c.name,
+        initiative: c.initiative,
+        hp: c.actor?.system?.attributes?.hp?.value,
+        maxHp: c.actor?.system?.attributes?.hp?.max,
         defeated: c.isDefeated,
       })),
     };
   }
   private async handleDiagEval(data: { js: string }): Promise<any> {
-    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
     try {
       const fn = new Function('return (async () => { ' + data.js + ' })()');
       const out = await fn();
-      let safe; try { safe = JSON.parse(JSON.stringify(out)); } catch (e) { safe = String(out); }
+      let safe;
+      try {
+        safe = JSON.parse(JSON.stringify(out));
+      } catch (e) {
+        safe = String(out);
+      }
       return { success: true, result: safe };
-    } catch (e: any) { return { success: false, error: String((e && (e.stack || e.message)) || e) }; }
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
   }
 
-  private async handleExecuteAttack(data: { attacker: string; item: string; targets: string[] }): Promise<any> {
-    const gm = this.validateGMAccess(); if (!gm.allowed) return { error: 'Access denied', success: false };
+  private async handleExecuteAttack(data: {
+    attacker: string;
+    item: string;
+    targets: string[];
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
     const MidiQOL = (globalThis as any).MidiQOL;
     if (!MidiQOL) throw new Error('MidiQOL not available');
     const scene = this._activeScene();
     const attTok = this._findToken(scene, data.attacker);
     if (!attTok) throw new Error('Attacker token not found: ' + data.attacker);
-    const actor = attTok.actor; if (!actor) throw new Error('Attacker has no actor');
+    const actor = attTok.actor;
+    if (!actor) throw new Error('Attacker has no actor');
     const itemLower = String(data.item).toLowerCase();
-    const item = actor.items.find((i: any) => i.name?.toLowerCase() === itemLower && i.system?.activities?.size)
-      || actor.items.find((i: any) => i.name?.toLowerCase() === itemLower);
+    const item =
+      actor.items.find(
+        (i: any) => i.name?.toLowerCase() === itemLower && i.system?.activities?.size
+      ) || actor.items.find((i: any) => i.name?.toLowerCase() === itemLower);
     if (!item) throw new Error('Item not found on attacker: ' + data.item);
     const activities = [...((item.system.activities as any) || [])];
     const activity = activities.find((a: any) => a.type === 'attack') || activities[0];
     if (!activity) throw new Error('No usable activity on item: ' + data.item);
     // Spell slots: a leveled spell (not a cantrip) must have a slot to cast, and casting spends one
     // (in 5e the slot is consumed whether it hits, misses, or the target saves).
-    const spellLevel = (item.type === 'spell' && (item.system.level || 0) > 0) ? item.system.level : 0;
+    const spellLevel =
+      item.type === 'spell' && (item.system.level || 0) > 0 ? item.system.level : 0;
     if (spellLevel > 0) {
       const slot = actor.system.spells?.['spell' + spellLevel];
       if (!slot || (slot.value || 0) <= 0)
-        return { success: false, error: 'No level-' + spellLevel + ' spell slots remaining', attacker: attTok.name, item: item.name };
+        return {
+          success: false,
+          error: 'No level-' + spellLevel + ' spell slots remaining',
+          attacker: attTok.name,
+          item: item.name,
+        };
     }
-    const consumeSlot = async () => { if (spellLevel > 0) { const s: any = actor.system.spells['spell' + spellLevel];
-      await actor.update({ ['system.spells.spell' + spellLevel + '.value']: Math.max(0, (s.value || 0) - 1) }); } };
+    const consumeSlot = async () => {
+      if (spellLevel > 0) {
+        const s: any = actor.system.spells['spell' + spellLevel];
+        await actor.update({
+          ['system.spells.spell' + spellLevel + '.value']: Math.max(0, (s.value || 0) - 1),
+        });
+      }
+    };
 
     const isAttack = activity.type === 'attack' || !!(activity as any).attack;
     const isHeal = activity.type === 'heal';
     const spellEffects = [...((item.effects as any) || [])].filter((e: any) => !e.transfer);
     const isSave = activity.type === 'save' || !!(activity as any).save;
-    const isBuff = !isAttack && !isHeal && !isSave && (activity.type === 'utility' || spellEffects.length > 0);
+    const isBuff =
+      !isAttack && !isHeal && !isSave && (activity.type === 'utility' || spellEffects.length > 0);
 
-    let targetToks = (data.targets || []).map((r: string) => this._findToken(scene, r)).filter(Boolean);
+    let targetToks = (data.targets || [])
+      .map((r: string) => this._findToken(scene, r))
+      .filter(Boolean);
     // Heals and buffs default to the caster (self) when no target is named ("I cast Bless").
     if (!targetToks.length && (isHeal || isBuff)) targetToks = [attTok];
     if (!targetToks.length) throw new Error('No valid targets');
@@ -2206,76 +2295,175 @@ export class QueryHandlers {
     // of sight (walls). Melee that is out of reach walks into reach first (5e move+attack).
     {
       const _M: any = (globalThis as any).MidiQOL;
-      const _rng: any = (item.system.range || {});
+      const _rng: any = item.system.range || {};
       const _isSelfSpell = _rng.units === 'self';
       const _isRangedWeapon = item.type === 'weapon' && (_rng.value || 0) > 5;
       const _needsAdjacent = (item.type === 'weapon' && !_isRangedWeapon) || _rng.units === 'touch';
-      const _gs = (scene.grid?.size) || 100; const _G = (v: number) => Math.round(v / _gs);
-      const _inRange = (tgt: any) => { try { const rr = _M?.checkActivityRange(activity, attTok.object, new Set([tgt.object]), false); return !rr || rr.result !== 'fail'; } catch (e) { return true; } };
-      const _dist = (tgt: any) => { try { return _M?.computeDistance(attTok.object, tgt.object, { wallsBlock: false }); } catch (e) { return -1; } };
-      const _canSee = (tgt: any) => { try { return _M?.canSee ? _M.canSee(attTok.object, tgt.object) : true; } catch (e) { return true; } };
+      const _gs = scene.grid?.size || 100;
+      const _G = (v: number) => Math.round(v / _gs);
+      const _inRange = (tgt: any) => {
+        try {
+          const rr = _M?.checkActivityRange(activity, attTok.object, new Set([tgt.object]), false);
+          return !rr || rr.result !== 'fail';
+        } catch (e) {
+          return true;
+        }
+      };
+      const _dist = (tgt: any) => {
+        try {
+          return _M?.computeDistance(attTok.object, tgt.object, { wallsBlock: false });
+        } catch (e) {
+          return -1;
+        }
+      };
+      const _canSee = (tgt: any) => {
+        try {
+          return _M?.canSee ? _M.canSee(attTok.object, tgt.object) : true;
+        } catch (e) {
+          return true;
+        }
+      };
       const _valid: any[] = [];
       for (const t of targetToks) {
         const _isSelf = t.id === attTok.id;
-        if (_isSelfSpell && !_isSelf) { results.push({ target: t.name, hit: false, error: item.name + ' can only affect the caster' }); continue; }
-        if (_isSelf) { _valid.push(t); continue; }
-        if (!_canSee(t)) { results.push({ target: t.name, hit: false, outOfSight: true, note: 'no line of sight to ' + t.name }); continue; }
+        if (_isSelfSpell && !_isSelf) {
+          results.push({
+            target: t.name,
+            hit: false,
+            error: item.name + ' can only affect the caster',
+          });
+          continue;
+        }
+        if (_isSelf) {
+          _valid.push(t);
+          continue;
+        }
+        if (!_canSee(t)) {
+          results.push({
+            target: t.name,
+            hit: false,
+            outOfSight: true,
+            note: 'no line of sight to ' + t.name,
+          });
+          continue;
+        }
         if (!_inRange(t)) {
           if (_needsAdjacent) {
-            const _spd = attTok.actor?.system?.attributes?.movement?.walk || 30; const _gridSpeed = Math.max(0, Math.floor(_spd / 5));
-            let _cx = _G(attTok.x), _cy = _G(attTok.y); const _tx = _G(t.x), _ty = _G(t.y); let _steps = 0;
-            while (_steps < _gridSpeed && Math.max(Math.abs(_cx - _tx), Math.abs(_cy - _ty)) > 1) { if (_cx < _tx) _cx++; else if (_cx > _tx) _cx--; if (_cy < _ty) _cy++; else if (_cy > _ty) _cy--; _steps++; }
-            if (_steps > 0) { await attTok.update({ x: _cx * _gs, y: _cy * _gs }); await new Promise((r) => setTimeout(r, 400)); }
-            if (!_inRange(t)) { results.push({ target: t.name, hit: false, outOfReach: true, movedFeet: _steps * 5, note: 'moved ' + (_steps * 5) + 'ft but ' + t.name + ' is still out of reach' }); continue; }
+            const _spd = attTok.actor?.system?.attributes?.movement?.walk || 30;
+            const _gridSpeed = Math.max(0, Math.floor(_spd / 5));
+            let _cx = _G(attTok.x),
+              _cy = _G(attTok.y);
+            const _tx = _G(t.x),
+              _ty = _G(t.y);
+            let _steps = 0;
+            while (_steps < _gridSpeed && Math.max(Math.abs(_cx - _tx), Math.abs(_cy - _ty)) > 1) {
+              if (_cx < _tx) _cx++;
+              else if (_cx > _tx) _cx--;
+              if (_cy < _ty) _cy++;
+              else if (_cy > _ty) _cy--;
+              _steps++;
+            }
+            if (_steps > 0) {
+              await attTok.update({ x: _cx * _gs, y: _cy * _gs });
+              await new Promise(r => setTimeout(r, 400));
+            }
+            if (!_inRange(t)) {
+              results.push({
+                target: t.name,
+                hit: false,
+                outOfReach: true,
+                movedFeet: _steps * 5,
+                note: 'moved ' + _steps * 5 + 'ft but ' + t.name + ' is still out of reach',
+              });
+              continue;
+            }
           } else {
-            const _df = _dist(t); results.push({ target: t.name, hit: false, outOfRange: true, note: t.name + ' is ' + (_df >= 0 ? _df + 'ft' : 'too far') + ' away, beyond the range of ' + item.name }); continue;
+            const _df = _dist(t);
+            results.push({
+              target: t.name,
+              hit: false,
+              outOfRange: true,
+              note:
+                t.name +
+                ' is ' +
+                (_df >= 0 ? _df + 'ft' : 'too far') +
+                ' away, beyond the range of ' +
+                item.name,
+            });
+            continue;
           }
         }
         _valid.push(t);
       }
       targetToks = _valid;
     }
-    if (!targetToks.length) return { success: false, attacker: attTok.name, item: item.name, results, refused: true };
+    if (!targetToks.length)
+      return { success: false, attacker: attTok.name, item: item.name, results, refused: true };
     const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
     attTok.object?.control({ releaseOthers: true });
 
     // ---- HEAL (Cure Wounds, Healing Word): Midi's cast no-ops headless, so roll + apply HP. ----
     if (isHeal) {
-      let healed = 0, error: string | null = null;
+      let healed = 0,
+        error: string | null = null;
       try {
         const dr = await (activity as any).rollDamage({}, { configure: false }, {});
         const rolls = Array.isArray(dr) ? dr : [dr];
         healed = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
-      } catch (e: any) { error = String((e && (e.message)) || e); }
+      } catch (e: any) {
+        error = String((e && e.message) || e);
+      }
       for (const t of targetToks) {
         const hp = t.actor?.system?.attributes?.hp;
-        const before = hp?.value ?? 0, max = hp?.max ?? before;
+        const before = hp?.value ?? 0,
+          max = hp?.max ?? before;
         const after = Math.min(max, before + healed);
         if (after !== before) await t.actor.update({ 'system.attributes.hp.value': after });
-        if (before <= 0 && after > 0) { const conds = (t.actor.effects || []).filter((e: any) => e.statuses && e.statuses.size > 0).map((e: any) => e.id);
-          if (conds.length) await t.actor.deleteEmbeddedDocuments('ActiveEffect', conds); }
-        results.push({ target: t.name, hpBefore: before, hpAfter: after, healed: after - before, via: 'heal', error });
+        if (before <= 0 && after > 0) {
+          const conds = (t.actor.effects || [])
+            .filter((e: any) => e.statuses && e.statuses.size > 0)
+            .map((e: any) => e.id);
+          if (conds.length) await t.actor.deleteEmbeddedDocuments('ActiveEffect', conds);
+        }
+        results.push({
+          target: t.name,
+          hpBefore: before,
+          hpAfter: after,
+          healed: after - before,
+          via: 'heal',
+          error,
+        });
       }
       await consumeSlot();
-    return { success: true, attacker: attTok.name, item: item.name, results };
+      return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
     // ---- BUFF / UTILITY (Bless, etc.): apply the spell's active effect(s) to the targets. ----
     if (isBuff) {
-      const aes = spellEffects.map((e: any) => { const o = e.toObject(); o.origin = item.uuid; o.disabled = false; delete o._id; return o; });
+      const aes = spellEffects.map((e: any) => {
+        const o = e.toObject();
+        o.origin = item.uuid;
+        o.disabled = false;
+        delete o._id;
+        return o;
+      });
       for (const t of targetToks) {
         let applied: string[] = [];
         try {
           // avoid stacking the same-named effect on recast
-          const dupes = (t.actor.effects || []).filter((e: any) => aes.some((n: any) => n.name === e.name)).map((e: any) => e.id);
+          const dupes = (t.actor.effects || [])
+            .filter((e: any) => aes.some((n: any) => n.name === e.name))
+            .map((e: any) => e.id);
           if (dupes.length) await t.actor.deleteEmbeddedDocuments('ActiveEffect', dupes);
           const created = await t.actor.createEmbeddedDocuments('ActiveEffect', aes);
           applied = created.map((x: any) => x.name);
-        } catch (e) { /* ignore */ }
+        } catch (e) {
+          /* ignore */
+        }
         results.push({ target: t.name, effectsApplied: applied, via: 'buff' });
       }
       await consumeSlot();
-    return { success: true, attacker: attTok.name, item: item.name, results };
+      return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
     // ---- ATTACK-ROLL actions (weapons + spell attacks): Midi's use() no-ops headless. ----
@@ -2284,12 +2472,20 @@ export class QueryHandlers {
         const AC = t.actor?.system?.attributes?.ac?.value ?? 10;
         const hpBefore = t.actor?.system?.attributes?.hp?.value ?? 0;
         t.object?.setTarget(true, { user: (game as any).user, releaseOthers: true });
-        let attackTotal: number | null = null, crit = false, fumble = false, hit = false;
-        let damage = 0, damageType: string | null = null, hpAfter = hpBefore, error: string | null = null;
+        let attackTotal: number | null = null,
+          crit = false,
+          fumble = false,
+          hit = false;
+        let damage = 0,
+          damageType: string | null = null,
+          hpAfter = hpBefore,
+          error: string | null = null;
         try {
           const ar = await (activity as any).rollAttack({}, { configure: false }, {});
           const aroll = Array.isArray(ar) ? ar[0] : ar;
-          attackTotal = aroll?.total ?? null; crit = !!aroll?.isCritical; fumble = !!aroll?.isFumble;
+          attackTotal = aroll?.total ?? null;
+          crit = !!aroll?.isCritical;
+          fumble = !!aroll?.isFumble;
           hit = crit || (!fumble && attackTotal != null && attackTotal >= AC);
           if (hit) {
             const dr = await (activity as any).rollDamage({}, { configure: false }, {});
@@ -2297,42 +2493,321 @@ export class QueryHandlers {
             damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
             damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
             if (crit) {
-              const RollCls: any = (globalThis as any).foundry?.dice?.Roll || (globalThis as any).Roll;
-              for (const r of rolls) for (const term of ((r && r.terms) || [])) {
-                if (term && term.faces && term.number) {
-                  try { const er = new RollCls(`${term.number}d${term.faces}`); await er.evaluate(); damage += er.total; } catch (e) { /* ignore */ }
+              const RollCls: any =
+                (globalThis as any).foundry?.dice?.Roll || (globalThis as any).Roll;
+              for (const r of rolls)
+                for (const term of (r && r.terms) || []) {
+                  if (term && term.faces && term.number) {
+                    try {
+                      const er = new RollCls(`${term.number}d${term.faces}`);
+                      await er.evaluate();
+                      damage += er.total;
+                    } catch (e) {
+                      /* ignore */
+                    }
+                  }
                 }
-              }
             }
             await t.actor.applyDamage([{ value: damage, type: damageType }]);
             hpAfter = t.actor?.system?.attributes?.hp?.value ?? hpBefore;
           }
-        } catch (e: any) { error = String((e && (e.stack || e.message)) || e); }
-        results.push({ target: t.name, hpBefore, hpAfter, damage: hpBefore - hpAfter,
-          hit, crit, fumble, attackTotal, damageRolled: damage, damageType, targetAC: AC, via: 'attack', error });
+        } catch (e: any) {
+          error = String((e && (e.stack || e.message)) || e);
+        }
+        results.push({
+          target: t.name,
+          hpBefore,
+          hpAfter,
+          damage: hpBefore - hpAfter,
+          hit,
+          crit,
+          fumble,
+          attackTotal,
+          damageRolled: damage,
+          damageType,
+          targetAC: AC,
+          via: 'attack',
+          error,
+        });
       }
       await consumeSlot();
-    return { success: true, attacker: attTok.name, item: item.name, results };
+      return { success: true, attacker: attTok.name, item: item.name, results };
     }
 
     // ---- SAVE / other (Sacred Flame, Fireball): Midi resolves the save + half/none damage. ----
-    targetToks.forEach((t: any) => t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false }));
+    targetToks.forEach((t: any) =>
+      t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false })
+    );
     const before = targetToks.map((t: any) => ({ hp: t.actor?.system?.attributes?.hp?.value }));
     try {
       await MidiQOL.completeActivityUse(
         activity,
-        { midiOptions: { targetsToUse: new Set(targetObjs), autoRollAttack: true, autoRollDamage: 'always', fastForwardAttack: true, fastForwardDamage: true } },
-        { configure: false }, {}
+        {
+          midiOptions: {
+            targetsToUse: new Set(targetObjs),
+            autoRollAttack: true,
+            autoRollDamage: 'always',
+            fastForwardAttack: true,
+            fastForwardDamage: true,
+          },
+        },
+        { configure: false },
+        {}
       );
-    } catch (e) { /* swallow late headless UI throw */ }
-    for (let w = 0; w < 7; w++) { await new Promise((r) => setTimeout(r, 300));
-      if (targetToks.some((t: any, i: number) => (t.actor?.system?.attributes?.hp?.value) !== before[i].hp)) break; }
+    } catch (e) {
+      /* swallow late headless UI throw */
+    }
+    for (let w = 0; w < 7; w++) {
+      await new Promise(r => setTimeout(r, 300));
+      if (
+        targetToks.some(
+          (t: any, i: number) => t.actor?.system?.attributes?.hp?.value !== before[i].hp
+        )
+      )
+        break;
+    }
     for (let i = 0; i < targetToks.length; i++) {
-      const t = targetToks[i]; const hpAfter = t.actor?.system?.attributes?.hp?.value;
-      results.push({ target: t.name, hpBefore: before[i].hp, hpAfter, damage: (before[i].hp ?? 0) - (hpAfter ?? 0), via: 'save' });
+      const t = targetToks[i];
+      const hpAfter = t.actor?.system?.attributes?.hp?.value;
+      results.push({
+        target: t.name,
+        hpBefore: before[i].hp,
+        hpAfter,
+        damage: (before[i].hp ?? 0) - (hpAfter ?? 0),
+        via: 'save',
+      });
     }
     await consumeSlot();
     return { success: true, attacker: attTok.name, item: item.name, results };
   }
 
+  // ---- Scene provisioning tools (Phase B board-prep, B5/P6 report card; Section 4f audit gap). ----
+  // Adventure-agnostic: caller supplies name/grid/flags/package data; nothing here names a module.
+  private _findSceneByIdOrName(idOrName: string): any {
+    const scenes = (game as any).scenes?.contents || [];
+    let scene = (game as any).scenes?.get(idOrName);
+    if (!scene) {
+      const lower = String(idOrName).toLowerCase();
+      scene = scenes.find((s: any) => s.name?.toLowerCase() === lower);
+    }
+    return scene || null;
+  }
+
+  private _gridUpdatePayload(grid?: {
+    type?: number;
+    size?: number;
+    offsetX?: number;
+    offsetY?: number;
+  }): any {
+    if (!grid) return undefined;
+    const g: any = {};
+    if (grid.type !== undefined) g.type = grid.type;
+    if (grid.size !== undefined) g.size = grid.size;
+    if (grid.offsetX !== undefined) g.offsetX = grid.offsetX;
+    if (grid.offsetY !== undefined) g.offsetY = grid.offsetY;
+    return Object.keys(g).length ? g : undefined;
+  }
+
+  private async handleSceneCreate(data: {
+    name?: string;
+    background?: string;
+    flags?: any;
+    grid?: { type?: number; size?: number; offsetX?: number; offsetY?: number };
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.name || typeof data.name !== 'string' || !data.name.trim()) {
+        throw new Error('name is required');
+      }
+      const sceneData: any = { name: data.name.trim() };
+      if (data.background) sceneData.background = { src: data.background };
+      const grid = this._gridUpdatePayload(data.grid);
+      if (grid) sceneData.grid = grid;
+      if (data.flags) sceneData.flags = data.flags;
+
+      const SceneCls: any = (globalThis as any).Scene;
+      if (!SceneCls?.create) throw new Error('Scene document class unavailable');
+      const created = await SceneCls.create(sceneData);
+      if (!created) throw new Error('Scene.create returned no document');
+      return { success: true, id: created.id, name: created.name };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleSceneUpdate(data: {
+    id?: string;
+    scene_identifier?: string;
+    name?: string;
+    background?: string;
+    flags?: any;
+    grid?: { type?: number; size?: number; offsetX?: number; offsetY?: number };
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      const locator = data?.id || data?.scene_identifier;
+      if (!locator) throw new Error('id or scene_identifier is required to locate the scene');
+      const scene = this._findSceneByIdOrName(locator);
+      if (!scene) throw new Error(`Scene not found: "${locator}"`);
+
+      const update: any = {};
+      if (data.name && typeof data.name === 'string' && data.name.trim()) {
+        update.name = data.name.trim();
+      }
+      if (data.background) update.background = { src: data.background };
+      const grid = this._gridUpdatePayload(data.grid);
+      if (grid) update.grid = grid;
+      if (data.flags && typeof data.flags === 'object') {
+        // Merge-safe: set flags.<namespace>.<key> individually so a partial flags object never
+        // clobbers sibling keys already stored under the same namespace (e.g. another module's
+        // flags, or other keys under flags.aidm the caller did not mention this call).
+        for (const [ns, nsVal] of Object.entries(data.flags)) {
+          if (nsVal && typeof nsVal === 'object' && !Array.isArray(nsVal)) {
+            for (const [k, v] of Object.entries(nsVal as any)) {
+              update[`flags.${ns}.${k}`] = v;
+            }
+          } else {
+            update[`flags.${ns}`] = nsVal;
+          }
+        }
+      }
+
+      if (Object.keys(update).length === 0) {
+        throw new Error('No fields to update: provide name, background, grid, and/or flags');
+      }
+
+      await scene.update(update);
+      return { success: true, id: scene.id, name: scene.name };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleListInstalledPackages(_data: any): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      const packages: any[] = [];
+      const packs: any[] = Array.from((game as any).packs?.values?.() || []);
+      for (const pack of packs) {
+        const meta = pack.metadata || {};
+        try {
+          if (meta.type === 'Adventure') {
+            const index = await pack.getIndex({ fields: ['name'] });
+            for (const entry of index) {
+              try {
+                const adv: any = await pack.getDocument(entry._id);
+                const sceneList = (adv?.scenes?.contents || adv?.scenes || []) as any[];
+                const scenes = sceneList.map((s: any) => ({
+                  name: s.name,
+                  ref: `${pack.collection}.${entry._id}.${s._id || s.id}`,
+                }));
+                packages.push({
+                  id: `${pack.collection}:${entry._id}`,
+                  name: entry.name || adv?.name || meta.label || pack.collection,
+                  scenes,
+                });
+              } catch (innerErr) {
+                // one bad Adventure document must not fail the whole listing
+                continue;
+              }
+            }
+          } else if (meta.type === 'Scene') {
+            const index = await pack.getIndex({ fields: ['name'] });
+            const scenes = (index as any[]).map((entry: any) => ({
+              name: entry.name,
+              ref: `${pack.collection}.${entry._id}`,
+            }));
+            if (scenes.length) {
+              packages.push({ id: pack.collection, name: meta.label || pack.collection, scenes });
+            }
+          }
+        } catch (packErr) {
+          // one unreadable pack must not fail the whole listing
+          continue;
+        }
+      }
+      return { success: true, packages };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e), packages: [] };
+    }
+  }
+
+  // NOTE (evidence for the "harder than the scene tools" check): Foundry's Adventure-document
+  // import API has changed shape across core versions (a one-call importAll() on older cores vs a
+  // two-step prepareImport()/importContent() on newer ones), and this handler cannot be exercised
+  // against a live world in a code-only, no-deploy task. Both branches below are written against
+  // the documented v13 Adventure API and the plain compendium-Scene path, but treat this one path
+  // as UNVERIFIED until BR1 (or the Orchestrator) runs it against the real dnd-dm-main world.
+  private async handleAdventureImport(data: {
+    package?: string;
+    scene_ref?: string;
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.scene_ref) throw new Error('scene_ref is required');
+      const parts = String(data.scene_ref).split('.');
+
+      if (parts.length === 4) {
+        // Adventure-document ref: "<packType>.<packName>.<adventureId>.<sceneId>"
+        const [packType, packName, advId, sceneId] = parts;
+        const pack: any = (game as any).packs?.get(`${packType}.${packName}`);
+        if (!pack) throw new Error(`Pack not found: ${packType}.${packName}`);
+        const adv: any = await pack.getDocument(advId);
+        if (!adv) throw new Error(`Adventure not found: ${advId}`);
+
+        let importResult: any;
+        if (typeof adv.prepareImport === 'function' && typeof adv.importContent === 'function') {
+          // Newer Foundry core: two-step Adventure import, scoped to just this one scene.
+          const toImport = await adv.prepareImport({ documentTypes: ['Scene'] });
+          if (toImport?.toCreate?.Scene) {
+            toImport.toCreate.Scene = toImport.toCreate.Scene.filter((s: any) => s._id === sceneId);
+          }
+          importResult = await adv.importContent(toImport);
+        } else if (typeof adv.import === 'function') {
+          // Older Foundry core: single-call import.
+          importResult = await adv.import({ documentTypes: ['Scene'] });
+        } else {
+          throw new Error(
+            'Adventure document has no supported import method on this Foundry version'
+          );
+        }
+
+        const created =
+          importResult?.toCreate?.Scene ||
+          importResult?.created?.Scene ||
+          importResult?.Scene ||
+          [];
+        const importedScene =
+          (Array.isArray(created) ? created : []).find((s: any) => (s._id || s.id) === sceneId) ||
+          (game as any).scenes?.contents?.find((s: any) =>
+            s.getFlag?.('core', 'sourceId')?.includes(sceneId)
+          );
+        if (!importedScene) {
+          throw new Error(
+            'Adventure import ran but the target scene could not be located afterward (UNVERIFIED path, see code comment)'
+          );
+        }
+        return { success: true, scene_id: importedScene.id || importedScene._id };
+      } else if (parts.length === 3) {
+        // Standalone Scene-pack ref: "<packType>.<packName>.<sceneId>"
+        const [packType, packName, sceneId] = parts;
+        const pack: any = (game as any).packs?.get(`${packType}.${packName}`);
+        if (!pack) throw new Error(`Pack not found: ${packType}.${packName}`);
+        const sourceScene: any = await pack.getDocument(sceneId);
+        if (!sourceScene) throw new Error(`Scene not found in pack: ${sceneId}`);
+        const SceneCls: any = (globalThis as any).Scene;
+        const imported = await SceneCls.create(sourceScene.toObject());
+        if (!imported) throw new Error('Scene.create returned no document');
+        return { success: true, scene_id: imported.id };
+      }
+
+      throw new Error(`Unrecognized scene_ref shape: "${data.scene_ref}"`);
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
 }

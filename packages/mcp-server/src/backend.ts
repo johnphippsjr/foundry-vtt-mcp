@@ -21,6 +21,7 @@ import { CharacterTools } from './tools/character.js';
 import { CompendiumTools } from './tools/compendium.js';
 
 import { SceneTools } from './tools/scene.js';
+import { SceneManagementTools } from './tools/scene-management.js';
 
 import { ActorCreationTools } from './tools/actor-creation.js';
 import { ActorManagementTools } from './tools/actor-management.js';
@@ -1192,6 +1193,7 @@ async function startBackend(): Promise<void> {
   const compendiumTools = new CompendiumTools({ foundryClient, logger, systemRegistry });
 
   const sceneTools = new SceneTools({ foundryClient, logger });
+  const sceneManagementTools = new SceneManagementTools({ foundryClient, logger });
 
   const actorCreationTools = new ActorCreationTools({ foundryClient, logger });
   const actorManagementTools = new ActorManagementTools({ foundryClient, logger, systemRegistry });
@@ -1421,6 +1423,7 @@ async function startBackend(): Promise<void> {
     ...compendiumTools.getToolDefinitions(),
 
     ...sceneTools.getToolDefinitions(),
+    ...sceneManagementTools.getToolDefinitions(),
 
     ...actorCreationTools.getToolDefinitions(),
     ...actorManagementTools.getToolDefinitions(),
@@ -1775,6 +1778,26 @@ async function startBackend(): Promise<void> {
 
                 case 'switch-scene':
                   result = await mapGenerationTools.switchScene(args);
+
+                  break;
+
+                case 'scene-create':
+                  result = await sceneManagementTools.handleSceneCreate(args);
+
+                  break;
+
+                case 'scene-update':
+                  result = await sceneManagementTools.handleSceneUpdate(args);
+
+                  break;
+
+                case 'list-installed-packages':
+                  result = await sceneManagementTools.handleListInstalledPackages(args);
+
+                  break;
+
+                case 'adventure-import':
+                  result = await sceneManagementTools.handleAdventureImport(args);
 
                   break;
 

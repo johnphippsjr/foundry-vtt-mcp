@@ -120,6 +120,15 @@ export class SceneTools {
       },
     };
 
+    // Phase B board-prep addition: pass through the module's grid detail + flags (Section 4f
+    // audit gap) when present, without disturbing any field already built above.
+    if (sceneData.grid) {
+      response.grid = sceneData.grid;
+    }
+    if (sceneData.flags) {
+      response.flags = sceneData.flags;
+    }
+
     if (includeTokens && sceneData.tokens) {
       response.tokens = this.formatTokens(sceneData.tokens, includeHidden);
       response.tokenSummary = this.createTokenSummary(sceneData.tokens, includeHidden);
