@@ -49,6 +49,15 @@ export class QueryHandlers {
       this.handleListInstalledPackages.bind(this);
     CONFIG.queries[`${modulePrefix}.adventure-import`] = this.handleAdventureImport.bind(this);
 
+    // Phase E wall/lighting queries (audited gap: no wall/light tools existed anywhere in the
+    // fork before this). Same batched-embedded-document pattern as addActorsToScene/createTokens.
+    CONFIG.queries[`${modulePrefix}.walls-create`] = this.handleWallsCreate.bind(this);
+    CONFIG.queries[`${modulePrefix}.walls-delete`] = this.handleWallsDelete.bind(this);
+    CONFIG.queries[`${modulePrefix}.list-walls`] = this.handleListWalls.bind(this);
+    CONFIG.queries[`${modulePrefix}.lights-create`] = this.handleLightsCreate.bind(this);
+    CONFIG.queries[`${modulePrefix}.lights-delete`] = this.handleLightsDelete.bind(this);
+    CONFIG.queries[`${modulePrefix}.list-lights`] = this.handleListLights.bind(this);
+
     // Phase D user provisioning queries (join flow; PLAYER/TRUSTED only, never ASSISTANT/GM)
     CONFIG.queries[`${modulePrefix}.user-create`] = this.handleUserCreate.bind(this);
     CONFIG.queries[`${modulePrefix}.user-update`] = this.handleUserUpdate.bind(this);
@@ -2649,6 +2658,24 @@ export class QueryHandlers {
     background?: string;
     flags?: any;
     grid?: { type?: number; size?: number; offsetX?: number; offsetY?: number };
+    // Phase E addition: fog/vision fields. Field names verified against the v13 SceneData
+    // schema (https://foundryvtt.com/api/v13/interfaces/foundry.documents.types.SceneData.html)
+    // -- see bridge/README.md's 0004 entry for the full citation trail. "globalLight" and
+    // "darkness" are NOT flat Scene fields in v13 (that was pre-v12 shape); they live under
+    // scene.environment, which is why this is nested rather than flat like grid/flags above.
+    tokenVision?: boolean;
+    environment?: {
+      darknessLevel?: number;
+      darknessLevelLock?: boolean;
+      cycle?: boolean;
+      globalLight?: { enabled?: boolean; bright?: boolean; alpha?: number; color?: string | null };
+    };
+    fog?: {
+      exploration?: boolean;
+      overlay?: string | null;
+      reset?: number | null;
+      colors?: { explored?: string | null; unexplored?: string | null };
+    };
   }): Promise<any> {
     const gm = this.validateGMAccess();
     if (!gm.allowed) return { error: 'Access denied', success: false };
@@ -2680,8 +2707,38 @@ export class QueryHandlers {
         }
       }
 
+      // Phase E: fog-of-war / vision fields, dotted-path so a partial payload never clobbers
+      // sibling keys under scene.environment or scene.fog it did not mention.
+      if (data.tokenVision !== undefined) update.tokenVision = data.tokenVision;
+      if (data.environment && typeof data.environment === 'object') {
+        const env = data.environment;
+        if (env.darknessLevel !== undefined)
+          update['environment.darknessLevel'] = env.darknessLevel;
+        if (env.darknessLevelLock !== undefined)
+          update['environment.darknessLevelLock'] = env.darknessLevelLock;
+        if (env.cycle !== undefined) update['environment.cycle'] = env.cycle;
+        if (env.globalLight && typeof env.globalLight === 'object') {
+          for (const [k, v] of Object.entries(env.globalLight)) {
+            update[`environment.globalLight.${k}`] = v;
+          }
+        }
+      }
+      if (data.fog && typeof data.fog === 'object') {
+        const fog = data.fog;
+        if (fog.exploration !== undefined) update['fog.exploration'] = fog.exploration;
+        if (fog.overlay !== undefined) update['fog.overlay'] = fog.overlay;
+        if (fog.reset !== undefined) update['fog.reset'] = fog.reset;
+        if (fog.colors && typeof fog.colors === 'object') {
+          for (const [k, v] of Object.entries(fog.colors)) {
+            update[`fog.colors.${k}`] = v;
+          }
+        }
+      }
+
       if (Object.keys(update).length === 0) {
-        throw new Error('No fields to update: provide name, background, grid, and/or flags');
+        throw new Error(
+          'No fields to update: provide name, background, grid, flags, tokenVision, environment, and/or fog'
+        );
       }
 
       await scene.update(update);
@@ -2814,6 +2871,235 @@ export class QueryHandlers {
       throw new Error(`Unrecognized scene_ref shape: "${data.scene_ref}"`);
     } catch (e: any) {
       return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  // ---- Phase E wall/lighting tools (the audited gap: no wall/light tools existed anywhere in
+  // the fork before this). Same additive, adventure-agnostic pattern as the Phase B scene tools
+  // above: caller supplies raw field data, nothing here names a module or adventure. Field names
+  // are the real v13 WallDocument/AmbientLightDocument/Scene schema names, verified against the
+  // official v13 API docs (not guessed) -- see bridge/README.md's 0004 entry for the full
+  // citation trail:
+  //   Wall:   https://foundryvtt.com/api/v13/interfaces/foundry.documents.types.WallData.html
+  //   Light:  https://foundryvtt.com/api/v13/interfaces/foundry.documents.types.AmbientLightData.html
+  //   Scene:  https://foundryvtt.com/api/v13/interfaces/foundry.documents.types.SceneData.html
+  // createEmbeddedDocuments/deleteEmbeddedDocuments are called ONCE per request with the whole
+  // batch (matching addActorsToScene's existing batched-create pattern), not once per element.
+  // Delete-by-ids is idempotent: ids that no longer exist on the scene are reported back under
+  // notFoundIds rather than throwing, the same shape dataAccess.deleteTokens already uses.
+
+  private _wallCreatePayload(w: any): any {
+    const validCoords =
+      w && Array.isArray(w.c) && w.c.length === 4 && w.c.every((n: any) => typeof n === 'number');
+    if (!validCoords) {
+      throw new Error('each wall requires c: [x1, y1, x2, y2] (four numbers)');
+    }
+    const payload: any = { c: w.c };
+    // light/move/sight/sound: CONST.WALL_SENSE_TYPES (light/sight/sound) and
+    // CONST.WALL_MOVEMENT_TYPES (move) -- NONE:0, LIMITED:10 (sense only), NORMAL:20,
+    // PROXIMITY:30 (sense only), DISTANCE:40 (sense only).
+    if (w.light !== undefined) payload.light = w.light;
+    if (w.move !== undefined) payload.move = w.move;
+    if (w.sight !== undefined) payload.sight = w.sight;
+    if (w.sound !== undefined) payload.sound = w.sound;
+    // dir: CONST.WALL_DIRECTIONS -- BOTH:0, LEFT:1, RIGHT:2.
+    if (w.dir !== undefined) payload.dir = w.dir;
+    // door: CONST.WALL_DOOR_TYPES -- NONE:0, DOOR:1, SECRET:2.
+    if (w.door !== undefined) payload.door = w.door;
+    // ds: CONST.WALL_DOOR_STATES -- CLOSED:0, OPEN:1, LOCKED:2. Only meaningful when door != 0.
+    if (w.ds !== undefined) payload.ds = w.ds;
+    if (w.doorSound !== undefined) payload.doorSound = w.doorSound;
+    // threshold: {light?, sight?, sound?: number; attenuation?: boolean} -- passed through as-is.
+    if (w.threshold && typeof w.threshold === 'object') payload.threshold = w.threshold;
+    return payload;
+  }
+
+  private async handleWallsCreate(data: { sceneId?: string; walls?: any[] }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.sceneId) throw new Error('sceneId is required');
+      if (!Array.isArray(data.walls) || data.walls.length === 0) {
+        throw new Error('walls array is required and must not be empty');
+      }
+      const scene = this._findSceneByIdOrName(data.sceneId);
+      if (!scene) throw new Error(`Scene not found: "${data.sceneId}"`);
+      const payload = data.walls.map((w: any) => this._wallCreatePayload(w));
+      const created: any[] = (await scene.createEmbeddedDocuments('Wall', payload)) || [];
+      return { success: true, count: created.length, ids: created.map((d: any) => d.id) };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleWallsDelete(data: { sceneId?: string; ids?: string[] }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.sceneId) throw new Error('sceneId is required');
+      if (!Array.isArray(data.ids) || data.ids.length === 0) {
+        throw new Error('ids array is required and must not be empty');
+      }
+      const scene = this._findSceneByIdOrName(data.sceneId);
+      if (!scene) throw new Error(`Scene not found: "${data.sceneId}"`);
+      const existingIds = data.ids.filter(id => !!scene.walls?.get?.(id));
+      const notFoundIds = data.ids.filter(id => !scene.walls?.get?.(id));
+      const deleted: any[] = existingIds.length
+        ? (await scene.deleteEmbeddedDocuments('Wall', existingIds)) || []
+        : [];
+      return {
+        success: true,
+        deletedCount: deleted.length,
+        deletedIds: existingIds,
+        notFoundIds: notFoundIds.length ? notFoundIds : undefined,
+      };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private _segmentBounds(
+    docs: any[],
+    getPoints: (d: any) => number[]
+  ): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+    for (const d of docs) {
+      const pts = getPoints(d) || [];
+      for (let i = 0; i + 1 < pts.length; i += 2) {
+        const x = pts[i];
+        const y = pts[i + 1];
+        if (typeof x !== 'number' || typeof y !== 'number') continue;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+    return { minX, minY, maxX, maxY };
+  }
+
+  private async handleListWalls(data: { sceneId?: string }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.sceneId) throw new Error('sceneId is required');
+      const scene = this._findSceneByIdOrName(data.sceneId);
+      if (!scene) throw new Error(`Scene not found: "${data.sceneId}"`);
+      const wallDocs: any[] = Array.from(scene.walls?.contents || scene.walls?.values?.() || []);
+      const walls = wallDocs.map((d: any) => ({
+        id: d.id,
+        c: d.c,
+        door: d.door,
+        ds: d.ds,
+        move: d.move,
+        sight: d.sight,
+        sound: d.sound,
+        light: d.light,
+        dir: d.dir,
+      }));
+      const bounds = this._segmentBounds(wallDocs, d => d.c);
+      return { success: true, count: walls.length, bounds, walls };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e), walls: [] };
+    }
+  }
+
+  private _lightCreatePayload(l: any): any {
+    if (!l || typeof l.x !== 'number' || typeof l.y !== 'number') {
+      throw new Error('each light requires numeric x and y');
+    }
+    const payload: any = { x: l.x, y: l.y };
+    if (l.rotation !== undefined) payload.rotation = l.rotation;
+    if (l.elevation !== undefined) payload.elevation = l.elevation;
+    if (l.hidden !== undefined) payload.hidden = l.hidden;
+    // walls/vision: booleans -- is this light blocked by walls, does it grant vision.
+    if (l.walls !== undefined) payload.walls = l.walls;
+    if (l.vision !== undefined) payload.vision = l.vision;
+    // config: LightData subset (bright, dim, angle, color, alpha, luminosity, saturation,
+    // contrast, shadows, attenuation, animation, darkness:{min,max}, ...) -- passed through as-is,
+    // the same way scene-update passes flags through as-is; Foundry's own schema cleans/validates
+    // it on write.
+    if (l.config && typeof l.config === 'object') payload.config = l.config;
+    return payload;
+  }
+
+  private async handleLightsCreate(data: { sceneId?: string; lights?: any[] }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.sceneId) throw new Error('sceneId is required');
+      if (!Array.isArray(data.lights) || data.lights.length === 0) {
+        throw new Error('lights array is required and must not be empty');
+      }
+      const scene = this._findSceneByIdOrName(data.sceneId);
+      if (!scene) throw new Error(`Scene not found: "${data.sceneId}"`);
+      const payload = data.lights.map((l: any) => this._lightCreatePayload(l));
+      const created: any[] = (await scene.createEmbeddedDocuments('AmbientLight', payload)) || [];
+      return { success: true, count: created.length, ids: created.map((d: any) => d.id) };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleLightsDelete(data: { sceneId?: string; ids?: string[] }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.sceneId) throw new Error('sceneId is required');
+      if (!Array.isArray(data.ids) || data.ids.length === 0) {
+        throw new Error('ids array is required and must not be empty');
+      }
+      const scene = this._findSceneByIdOrName(data.sceneId);
+      if (!scene) throw new Error(`Scene not found: "${data.sceneId}"`);
+      const existingIds = data.ids.filter(id => !!scene.lights?.get?.(id));
+      const notFoundIds = data.ids.filter(id => !scene.lights?.get?.(id));
+      const deleted: any[] = existingIds.length
+        ? (await scene.deleteEmbeddedDocuments('AmbientLight', existingIds)) || []
+        : [];
+      return {
+        success: true,
+        deletedCount: deleted.length,
+        deletedIds: existingIds,
+        notFoundIds: notFoundIds.length ? notFoundIds : undefined,
+      };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+    }
+  }
+
+  private async handleListLights(data: { sceneId?: string }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      if (!data?.sceneId) throw new Error('sceneId is required');
+      const scene = this._findSceneByIdOrName(data.sceneId);
+      if (!scene) throw new Error(`Scene not found: "${data.sceneId}"`);
+      const lightDocs: any[] = Array.from(scene.lights?.contents || scene.lights?.values?.() || []);
+      const lights = lightDocs.map((d: any) => ({
+        id: d.id,
+        x: d.x,
+        y: d.y,
+        rotation: d.rotation,
+        elevation: d.elevation,
+        hidden: d.hidden,
+        walls: d.walls,
+        vision: d.vision,
+        config: {
+          bright: d.config?.bright,
+          dim: d.config?.dim,
+          angle: d.config?.angle,
+          color: d.config?.color,
+        },
+      }));
+      // Lights are points, not segments -- bounds are the min/max of each light's own [x,y].
+      const bounds = this._segmentBounds(lightDocs, d => [d.x, d.y]);
+      return { success: true, count: lights.length, bounds, lights };
+    } catch (e: any) {
+      return { success: false, error: String((e && (e.stack || e.message)) || e), lights: [] };
     }
   }
 

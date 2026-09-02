@@ -22,6 +22,7 @@ import { CompendiumTools } from './tools/compendium.js';
 
 import { SceneTools } from './tools/scene.js';
 import { SceneManagementTools } from './tools/scene-management.js';
+import { WallLightingTools } from './tools/wall-lighting.js';
 import { UserManagementTools } from './tools/user-management.js';
 
 import { ActorCreationTools } from './tools/actor-creation.js';
@@ -1195,6 +1196,7 @@ async function startBackend(): Promise<void> {
 
   const sceneTools = new SceneTools({ foundryClient, logger });
   const sceneManagementTools = new SceneManagementTools({ foundryClient, logger });
+  const wallLightingTools = new WallLightingTools({ foundryClient, logger });
   const userManagementTools = new UserManagementTools({ foundryClient, logger });
 
   const actorCreationTools = new ActorCreationTools({ foundryClient, logger });
@@ -1426,6 +1428,7 @@ async function startBackend(): Promise<void> {
 
     ...sceneTools.getToolDefinitions(),
     ...sceneManagementTools.getToolDefinitions(),
+    ...wallLightingTools.getToolDefinitions(),
     ...userManagementTools.getToolDefinitions(),
 
     ...actorCreationTools.getToolDefinitions(),
@@ -1801,6 +1804,38 @@ async function startBackend(): Promise<void> {
 
                 case 'adventure-import':
                   result = await sceneManagementTools.handleAdventureImport(args);
+
+                  break;
+
+                // Wall/lighting tools (Phase E)
+
+                case 'walls-create':
+                  result = await wallLightingTools.handleWallsCreate(args);
+
+                  break;
+
+                case 'walls-delete':
+                  result = await wallLightingTools.handleWallsDelete(args);
+
+                  break;
+
+                case 'list-walls':
+                  result = await wallLightingTools.handleListWalls(args);
+
+                  break;
+
+                case 'lights-create':
+                  result = await wallLightingTools.handleLightsCreate(args);
+
+                  break;
+
+                case 'lights-delete':
+                  result = await wallLightingTools.handleLightsDelete(args);
+
+                  break;
+
+                case 'list-lights':
+                  result = await wallLightingTools.handleListLights(args);
 
                   break;
 

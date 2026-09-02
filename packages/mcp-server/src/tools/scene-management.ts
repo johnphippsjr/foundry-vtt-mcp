@@ -65,7 +65,7 @@ export class SceneManagementTools {
       {
         name: 'scene-update',
         description:
-          'Update an existing Foundry VTT scene: rename it, change its background image, write grid settings (type/size/offsetX/offsetY), and/or merge flags (e.g. marking a scan-derived scene superseded). Partial update: only the fields you provide change. Locate the scene with "id" (exact scene id) or "scene_identifier" (name or id, same lookup switch-scene uses); "name" in the payload is always the NEW name to set, never the locator.',
+          'Update an existing Foundry VTT scene: rename it, change its background image, write grid settings (type/size/offsetX/offsetY), merge flags (e.g. marking a scan-derived scene superseded), and/or set fog-of-war/vision fields (tokenVision, environment.globalLight/darknessLevel, fog exploration). Partial update: only the fields you provide change. Locate the scene with "id" (exact scene id) or "scene_identifier" (name or id, same lookup switch-scene uses); "name" in the payload is always the NEW name to set, never the locator.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -90,6 +90,52 @@ export class SceneManagementTools {
               type: 'object',
               description:
                 'Flags to merge onto the scene (namespaced object); existing sibling keys under the same namespace are preserved.',
+            },
+            tokenVision: {
+              type: 'boolean',
+              description: 'Whether tokens on this scene use vision (Scene.tokenVision, v13).',
+            },
+            environment: {
+              type: 'object',
+              description:
+                'Ambience/lighting fields under Scene.environment (v13 schema; replaces the old flat globalLight/darkness fields from pre-v12). Only the provided sub-fields change.',
+              properties: {
+                darknessLevel: {
+                  type: 'number',
+                  description: '0 (midday, max illumination) to 1 (midnight, max darkness).',
+                },
+                darknessLevelLock: { type: 'boolean' },
+                cycle: { type: 'boolean', description: 'Whether darkness cycles automatically.' },
+                globalLight: {
+                  type: 'object',
+                  description: 'Global (unconditional) light for the whole scene.',
+                  properties: {
+                    enabled: { type: 'boolean' },
+                    bright: { type: 'boolean' },
+                    alpha: { type: 'number' },
+                    color: { type: ['string', 'null'] },
+                  },
+                },
+              },
+            },
+            fog: {
+              type: 'object',
+              description: 'Fog-of-war fields under Scene.fog (v13 schema).',
+              properties: {
+                exploration: {
+                  type: 'boolean',
+                  description: 'Whether fog exploration is enabled.',
+                },
+                overlay: { type: ['string', 'null'], description: 'Fog overlay image path.' },
+                reset: { type: ['number', 'null'], description: 'Fog reset timestamp/version.' },
+                colors: {
+                  type: 'object',
+                  properties: {
+                    explored: { type: ['string', 'null'] },
+                    unexplored: { type: ['string', 'null'] },
+                  },
+                },
+              },
             },
           },
         },
@@ -142,6 +188,9 @@ export class SceneManagementTools {
       background: args?.background,
       grid: args?.grid,
       flags: args?.flags,
+      tokenVision: args?.tokenVision,
+      environment: args?.environment,
+      fog: args?.fog,
     });
   }
 
