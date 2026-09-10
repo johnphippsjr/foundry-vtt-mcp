@@ -1,6 +1,12 @@
 import { MODULE_ID } from './constants.js';
 import { FoundryDataAccess } from './data-access.js';
 import { ComfyUIManager } from './comfyui-manager.js';
+import {
+  walkForSceneUuids,
+  packModuleId,
+  moduleSearchScope,
+  summarizeUnresolved,
+} from './adventure-import-utils.js';
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
@@ -48,6 +54,7 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.list-installed-packages`] =
       this.handleListInstalledPackages.bind(this);
     CONFIG.queries[`${modulePrefix}.adventure-import`] = this.handleAdventureImport.bind(this);
+    CONFIG.queries[`${modulePrefix}.scene-integrity`] = this.handleSceneIntegrity.bind(this);
 
     // Phase E wall/lighting queries (audited gap: no wall/light tools existed anywhere in the
     // fork before this). Same batched-embedded-document pattern as addActorsToScene/createTokens.
@@ -2798,12 +2805,358 @@ export class QueryHandlers {
     }
   }
 
-  // NOTE (evidence for the "harder than the scene tools" check): Foundry's Adventure-document
-  // import API has changed shape across core versions (a one-call importAll() on older cores vs a
-  // two-step prepareImport()/importContent() on newer ones), and this handler cannot be exercised
-  // against a live world in a code-only, no-deploy task. Both branches below are written against
-  // the documented v13 Adventure API and the plain compendium-Scene path, but treat this one path
-  // as UNVERIFIED until BR1 (or the Orchestrator) runs it against the real dnd-dm-main world.
+  // ---- adventure-import v2 (board #1311 root-cause fix, generic by construction). ----
+  //
+  // What was wrong (proven on the Death House sample, but the defect is generic): the old code
+  // called adv.prepareImport({documentTypes:['Scene']}) and then FILTERED toCreate.Scene down to
+  // just the one requested scene id before calling importContent(). Two consequences, for ANY
+  // adventure, not just this one: (1) sibling scenes in the same Adventure entry never get
+  // created, so any reference inside the imported scene that points at a sibling (a region
+  // behavior's teleport destination, at least) dangles forever; (2) Actors were never imported at
+  // all (documentTypes was hardcoded to ['Scene']), and nothing looked past the one Adventure
+  // entry that was asked for, so a module that ships its tokens' actors in a *different* Adventure
+  // entry (a shared "core resources" style entry) left every token with no world actor.
+  //
+  // The fix, in three parts, none of which name a specific module or adventure:
+  //  A. Import the WHOLE Adventure entry's Scene set in one prepareImport/importContent batch
+  //     (never filtered), so whatever id/consistency handling Foundry does across that batch
+  //     actually runs. Every created/matched scene is tagged flags.aidm.{sourcePack,
+  //     sourceSceneId,adoptedFor} so a later call can find it (idempotent: see _findAdoptedScene).
+  //  B. After import, walk every touched scene's regions[].behaviors[] for ANY string field that
+  //     looks like a document UUID rooted at "Scene.<16-char-id>" (not just a hardcoded
+  //     "destination" key -- see _walkForSceneUuids) and resolve it with Foundry's own
+  //     fromUuidSync, so a brand-new behavior type with its own uuid-bearing field is still
+  //     checked without this code needing to know its name.
+  //  C. Collect every actorId referenced by a token on the imported scenes, diff against
+  //     game.actors, and for anything still missing search every Adventure document in every pack
+  //     belonging to the same module OR any module listed in that module's OWN manifest
+  //     relationships.requires (read live off game.modules.get(id) -- never a hardcoded id) and
+  //     import matches with keepId:true.
+  // success is false whenever anything above is still unresolved, with error naming what -- this
+  // handler must fail loudly rather than report success on a partially-broken import.
+
+  // Walks regions[].behaviors[] on every given scene and resolves every Scene-rooted uuid found
+  // in a behavior's data via Foundry's own fromUuidSync -- this is what makes "Scene.<id>.Region.
+  // <id>" validation generic: fromUuidSync itself does scene.regions.get(regionId) internally, so
+  // this code never has to parse or assume the uuid's internal shape.
+  private async _resolveSceneRefs(
+    scenes: any[]
+  ): Promise<
+    { scene_id: string; region_id: string | null; behavior_id: string | null; target: string }[]
+  > {
+    const unresolved: {
+      scene_id: string;
+      region_id: string | null;
+      behavior_id: string | null;
+      target: string;
+    }[] = [];
+    const fromUuidSyncFn: any = (globalThis as any).fromUuidSync;
+    for (const scene of scenes || []) {
+      const regions: any[] = Array.from((scene?.regions as any) ?? []);
+      for (const region of regions) {
+        const behaviors: any[] = Array.from((region?.behaviors as any) ?? []);
+        for (const behavior of behaviors) {
+          let data: any;
+          try {
+            data = behavior.toObject ? behavior.toObject() : behavior;
+          } catch (e) {
+            data = behavior;
+          }
+          const found: { path: string; value: string }[] = [];
+          walkForSceneUuids(data, 'behavior', new Set(), found);
+          for (const f of found) {
+            let resolved: any = null;
+            try {
+              resolved = fromUuidSyncFn ? fromUuidSyncFn(f.value) : null;
+            } catch (e) {
+              resolved = null;
+            }
+            if (!resolved) {
+              unresolved.push({
+                scene_id: scene.id,
+                region_id: region?.id ?? null,
+                behavior_id: behavior?.id ?? null,
+                target: f.value,
+              });
+            }
+          }
+        }
+      }
+    }
+    return unresolved;
+  }
+
+  private _missingActorIds(scenes: any[]): string[] {
+    const needed = new Set<string>();
+    for (const scene of scenes || []) {
+      const tokens: any[] = Array.from((scene?.tokens as any) ?? []);
+      for (const t of tokens) {
+        const actorId = t?.actorId || t?.actor?.id;
+        if (actorId) needed.add(actorId);
+      }
+    }
+    return Array.from(needed).filter(id => !(game as any).actors?.get(id));
+  }
+
+  // Searches every Adventure document in every pack in scope for actors matching the still-
+  // missing ids and imports matches with keepId:true so token.actorId keeps pointing at them.
+  private async _resolveActors(
+    scenes: any[],
+    primaryPack: any
+  ): Promise<{ importedActorIds: string[]; unresolvedActorIds: string[] }> {
+    const missing = this._missingActorIds(scenes);
+    if (!missing.length) return { importedActorIds: [], unresolvedActorIds: [] };
+
+    // Generic search scope: the module that owns the pack we imported from, plus every module
+    // that module's OWN manifest declares under relationships.requires. This is how a module
+    // that ships its shared actors in a separate "requires" module (or a separate Adventure
+    // entry in its own pack) still resolves, without this code ever naming that module.
+    const scope = moduleSearchScope(primaryPack, id => (game as any).modules?.get(id));
+    const advPacks: any[] = [];
+    const packs: any[] = Array.from((game as any).packs?.values?.() || []);
+    for (const pack of packs) {
+      if (pack?.metadata?.type !== 'Adventure') continue;
+      const owner = packModuleId(pack);
+      if (owner && scope.has(owner)) advPacks.push(pack);
+    }
+    if (primaryPack && !advPacks.includes(primaryPack)) advPacks.push(primaryPack);
+
+    const stillMissing = new Set(missing);
+    const importedActorIds: string[] = [];
+    const ActorCls: any = (globalThis as any).Actor;
+    for (const pack of advPacks) {
+      if (!stillMissing.size) break;
+      let index: any[];
+      try {
+        index = Array.from((await pack.getIndex({ fields: ['name'] })) ?? []);
+      } catch (e) {
+        continue;
+      }
+      for (const entry of index) {
+        if (!stillMissing.size) break;
+        let adv: any;
+        try {
+          adv = await pack.getDocument(entry._id);
+        } catch (e) {
+          continue;
+        }
+        const actorList: any[] = Array.from((adv?.actors as any) ?? []);
+        for (const a of actorList) {
+          const srcId = a?._id || a?.id;
+          if (!srcId || !stillMissing.has(srcId)) continue;
+          try {
+            const actorData = a.toObject ? a.toObject() : a;
+            const created = ActorCls?.implementation
+              ? await ActorCls.implementation.createDocuments([actorData], { keepId: true })
+              : await ActorCls.createDocuments([actorData], { keepId: true });
+            if (created && created.length) {
+              importedActorIds.push(srcId);
+              stillMissing.delete(srcId);
+            }
+          } catch (actorErr) {
+            // leave in stillMissing -- reported unresolved below
+          }
+        }
+      }
+    }
+    return { importedActorIds, unresolvedActorIds: Array.from(stillMissing) };
+  }
+
+  private _emptyAdventureImportResult(error: string): any {
+    return {
+      success: false,
+      scene_id: null,
+      scene_name: null,
+      reused: false,
+      imported: { scenes: [], actors: [] },
+      unresolved: { scene_refs: [], actor_ids: [] },
+      error,
+    };
+  }
+
+  // Idempotency lookup: a world scene already tagged as having come from this exact pack+source
+  // scene id. Used both to short-circuit a repeat request for the same scene, and to let a later
+  // request for a SIBLING scene (already created and tagged by an earlier adventure-import call
+  // for a different scene in the same Adventure entry) bind to it without re-importing anything.
+  private _findAdoptedScene(sourcePack: string, sourceSceneId: string): any {
+    const scenes: any[] = Array.from(((game as any).scenes as any) ?? []);
+    return (
+      scenes.find(
+        (s: any) =>
+          s.getFlag?.('aidm', 'sourcePack') === sourcePack &&
+          s.getFlag?.('aidm', 'sourceSceneId') === sourceSceneId
+      ) || null
+    );
+  }
+
+  private async _finalizeAdventureImportResult(opts: {
+    targetScene: any;
+    allScenes: any[];
+    reused: boolean;
+    importedSceneIds: string[];
+    pack: any;
+  }): Promise<any> {
+    const unresolvedSceneRefs = await this._resolveSceneRefs(opts.allScenes);
+    const actorResult = await this._resolveActors(opts.allScenes, opts.pack);
+    const success = unresolvedSceneRefs.length === 0 && actorResult.unresolvedActorIds.length === 0;
+    return {
+      success,
+      scene_id: opts.targetScene.id,
+      scene_name: opts.targetScene.name,
+      reused: opts.reused,
+      imported: { scenes: opts.importedSceneIds, actors: actorResult.importedActorIds },
+      unresolved: { scene_refs: unresolvedSceneRefs, actor_ids: actorResult.unresolvedActorIds },
+      error: summarizeUnresolved(unresolvedSceneRefs, actorResult.unresolvedActorIds),
+    };
+  }
+
+  private async _importStandaloneScene(parts: string[]): Promise<any> {
+    const [packType, packName, sceneId] = parts;
+    const packCollection = `${packType}.${packName}`;
+    const pack: any = (game as any).packs?.get(packCollection);
+    if (!pack) return this._emptyAdventureImportResult(`Pack not found: ${packCollection}`);
+
+    const existing = this._findAdoptedScene(packCollection, sceneId);
+    if (existing) {
+      return await this._finalizeAdventureImportResult({
+        targetScene: existing,
+        allScenes: [existing],
+        reused: true,
+        importedSceneIds: [],
+        pack,
+      });
+    }
+
+    const sourceScene: any = await pack.getDocument(sceneId);
+    if (!sourceScene)
+      return this._emptyAdventureImportResult(`Scene not found in pack: ${sceneId}`);
+    const SceneCls: any = (globalThis as any).Scene;
+    if (!SceneCls?.create)
+      return this._emptyAdventureImportResult('Scene document class unavailable');
+    const sceneObj: any = sourceScene.toObject();
+    sceneObj.flags = sceneObj.flags || {};
+    sceneObj.flags.aidm = {
+      ...(sceneObj.flags.aidm || {}),
+      sourcePack: packCollection,
+      sourceSceneId: sceneId,
+      adoptedFor: sceneId,
+    };
+    const created = await SceneCls.create(sceneObj);
+    if (!created) return this._emptyAdventureImportResult('Scene.create returned no document');
+    return await this._finalizeAdventureImportResult({
+      targetScene: created,
+      allScenes: [created],
+      reused: false,
+      importedSceneIds: [sceneId],
+      pack,
+    });
+  }
+
+  private async _importAdventureScene(parts: string[]): Promise<any> {
+    const [packType, packName, advId, sceneId] = parts;
+    const packCollection = `${packType}.${packName}`;
+
+    // Fast path: this exact scene was already adopted by an earlier call (either as the primary
+    // target or as a sibling pulled in alongside one) -- return it, touch nothing in Foundry.
+    const existing = this._findAdoptedScene(packCollection, sceneId);
+    if (existing) {
+      const pack: any = (game as any).packs?.get(packCollection);
+      return await this._finalizeAdventureImportResult({
+        targetScene: existing,
+        allScenes: [existing],
+        reused: true,
+        importedSceneIds: [],
+        pack,
+      });
+    }
+
+    const pack: any = (game as any).packs?.get(packCollection);
+    if (!pack) return this._emptyAdventureImportResult(`Pack not found: ${packCollection}`);
+    const adv: any = await pack.getDocument(advId);
+    if (!adv) return this._emptyAdventureImportResult(`Adventure not found: ${advId}`);
+
+    if (!(typeof adv.prepareImport === 'function' && typeof adv.importContent === 'function')) {
+      if (typeof adv.import !== 'function') {
+        return this._emptyAdventureImportResult(
+          'Adventure document has no supported import method on this Foundry version'
+        );
+      }
+      // Older-core single-call fallback: no toCreate/toUpdate split available, so there is
+      // nothing to scope by hand here either -- import every document type the Adventure ships
+      // (never filtered to Scene alone, which is what dropped Actors on newer cores too).
+      const importResult: any = await adv.import();
+      const worldScene = (game as any).scenes?.get(sceneId);
+      if (!worldScene) {
+        return this._emptyAdventureImportResult(
+          `Adventure import ran (legacy import()) but scene ${sceneId} was not found afterward`
+        );
+      }
+      void importResult;
+      await worldScene.setFlag('aidm', 'sourcePack', packCollection);
+      await worldScene.setFlag('aidm', 'sourceSceneId', sceneId);
+      await worldScene.setFlag('aidm', 'adoptedFor', sceneId);
+      return await this._finalizeAdventureImportResult({
+        targetScene: worldScene,
+        allScenes: [worldScene],
+        reused: false,
+        importedSceneIds: [sceneId],
+        pack,
+      });
+    }
+
+    // Newer core: prepare the FULL Scene set for this Adventure entry -- never filtered down to
+    // one scene id. This is the actual root-cause fix: importing the whole set is what lets
+    // Foundry's own id/consistency handling across the batch run for every sibling scene.
+    const toImport = await adv.prepareImport({ documentTypes: ['Scene'] });
+    const toCreateIds = new Set<string>(
+      (toImport?.toCreate?.Scene ?? []).map((s: any) => s._id || s.id)
+    );
+    const toUpdateIds = new Set<string>(
+      (toImport?.toUpdate?.Scene ?? []).map((s: any) => s._id || s.id)
+    );
+    if (!toCreateIds.has(sceneId) && !toUpdateIds.has(sceneId)) {
+      return this._emptyAdventureImportResult(
+        `Scene ${sceneId} not found in Adventure ${advId}'s scene set`
+      );
+    }
+
+    await adv.importContent(toImport);
+
+    const allSourceIds = new Set<string>([...toCreateIds, ...toUpdateIds]);
+    const worldScenes: any[] = [];
+    const importedSceneIds: string[] = [];
+    for (const srcId of allSourceIds) {
+      const ws = (game as any).scenes?.get(srcId);
+      if (!ws) continue; // Foundry did not end up creating/updating this one -- surfaces below as
+      // a dangling reference if anything imported points at it.
+      worldScenes.push(ws);
+      const alreadyTagged =
+        ws.getFlag?.('aidm', 'sourcePack') === packCollection &&
+        ws.getFlag?.('aidm', 'sourceSceneId') === srcId;
+      if (!alreadyTagged) {
+        await ws.setFlag('aidm', 'sourcePack', packCollection);
+        await ws.setFlag('aidm', 'sourceSceneId', srcId);
+        await ws.setFlag('aidm', 'adoptedFor', sceneId);
+      }
+      if (toCreateIds.has(srcId)) importedSceneIds.push(srcId);
+    }
+
+    const targetScene = (game as any).scenes?.get(sceneId);
+    if (!targetScene) {
+      return this._emptyAdventureImportResult(
+        `Adventure import ran but the requested scene ${sceneId} could not be located afterward`
+      );
+    }
+
+    return await this._finalizeAdventureImportResult({
+      targetScene,
+      allScenes: worldScenes,
+      reused: false,
+      importedSceneIds,
+      pack,
+    });
+  }
+
   private async handleAdventureImport(data: {
     package?: string;
     scene_ref?: string;
@@ -2813,64 +3166,44 @@ export class QueryHandlers {
     try {
       if (!data?.scene_ref) throw new Error('scene_ref is required');
       const parts = String(data.scene_ref).split('.');
-
-      if (parts.length === 4) {
-        // Adventure-document ref: "<packType>.<packName>.<adventureId>.<sceneId>"
-        const [packType, packName, advId, sceneId] = parts;
-        const pack: any = (game as any).packs?.get(`${packType}.${packName}`);
-        if (!pack) throw new Error(`Pack not found: ${packType}.${packName}`);
-        const adv: any = await pack.getDocument(advId);
-        if (!adv) throw new Error(`Adventure not found: ${advId}`);
-
-        let importResult: any;
-        if (typeof adv.prepareImport === 'function' && typeof adv.importContent === 'function') {
-          // Newer Foundry core: two-step Adventure import, scoped to just this one scene.
-          const toImport = await adv.prepareImport({ documentTypes: ['Scene'] });
-          if (toImport?.toCreate?.Scene) {
-            toImport.toCreate.Scene = toImport.toCreate.Scene.filter((s: any) => s._id === sceneId);
-          }
-          importResult = await adv.importContent(toImport);
-        } else if (typeof adv.import === 'function') {
-          // Older Foundry core: single-call import.
-          importResult = await adv.import({ documentTypes: ['Scene'] });
-        } else {
-          throw new Error(
-            'Adventure document has no supported import method on this Foundry version'
-          );
-        }
-
-        const created =
-          importResult?.toCreate?.Scene ||
-          importResult?.created?.Scene ||
-          importResult?.Scene ||
-          [];
-        const importedScene =
-          (Array.isArray(created) ? created : []).find((s: any) => (s._id || s.id) === sceneId) ||
-          (game as any).scenes?.contents?.find((s: any) =>
-            s.getFlag?.('core', 'sourceId')?.includes(sceneId)
-          );
-        if (!importedScene) {
-          throw new Error(
-            'Adventure import ran but the target scene could not be located afterward (UNVERIFIED path, see code comment)'
-          );
-        }
-        return { success: true, scene_id: importedScene.id || importedScene._id };
-      } else if (parts.length === 3) {
-        // Standalone Scene-pack ref: "<packType>.<packName>.<sceneId>"
-        const [packType, packName, sceneId] = parts;
-        const pack: any = (game as any).packs?.get(`${packType}.${packName}`);
-        if (!pack) throw new Error(`Pack not found: ${packType}.${packName}`);
-        const sourceScene: any = await pack.getDocument(sceneId);
-        if (!sourceScene) throw new Error(`Scene not found in pack: ${sceneId}`);
-        const SceneCls: any = (globalThis as any).Scene;
-        const imported = await SceneCls.create(sourceScene.toObject());
-        if (!imported) throw new Error('Scene.create returned no document');
-        return { success: true, scene_id: imported.id };
-      }
-
+      if (parts.length === 3) return await this._importStandaloneScene(parts);
+      if (parts.length === 4) return await this._importAdventureScene(parts);
       throw new Error(`Unrecognized scene_ref shape: "${data.scene_ref}"`);
     } catch (e: any) {
-      return { success: false, error: String((e && (e.stack || e.message)) || e) };
+      return this._emptyAdventureImportResult(String((e && (e.stack || e.message)) || e));
+    }
+  }
+
+  // Read-only counterpart (item E, board #1311): reports the same {unresolved:{scene_refs,
+  // actor_ids}} shape as adventure-import for a scene that already exists in the world, WITHOUT
+  // importing or creating anything -- so a gate can check a world that was built by an earlier,
+  // pre-fix adventure-import call (or by hand) without touching it.
+  private async handleSceneIntegrity(data: {
+    scene_id?: string;
+    scene_identifier?: string;
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    try {
+      const locator = data?.scene_id || data?.scene_identifier;
+      if (!locator) throw new Error('scene_id or scene_identifier is required');
+      const scene = this._findSceneByIdOrName(locator);
+      if (!scene) throw new Error(`Scene not found: "${locator}"`);
+
+      const unresolvedSceneRefs = await this._resolveSceneRefs([scene]);
+      const unresolvedActorIds = this._missingActorIds([scene]);
+      const success = unresolvedSceneRefs.length === 0 && unresolvedActorIds.length === 0;
+      return {
+        success,
+        scene_id: scene.id,
+        scene_name: scene.name,
+        reused: true,
+        imported: { scenes: [], actors: [] },
+        unresolved: { scene_refs: unresolvedSceneRefs, actor_ids: unresolvedActorIds },
+        error: summarizeUnresolved(unresolvedSceneRefs, unresolvedActorIds),
+      };
+    } catch (e: any) {
+      return this._emptyAdventureImportResult(String((e && (e.stack || e.message)) || e));
     }
   }
 

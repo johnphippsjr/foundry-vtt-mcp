@@ -152,7 +152,7 @@ export class SceneManagementTools {
       {
         name: 'adventure-import',
         description:
-          'Import one scene from an installed package into the world (the adoption lane). Provide the package id and the scene "ref" string exactly as returned by list-installed-packages. Returns the id of the resulting world scene.',
+          'Import one scene from an installed package into the world (the adoption lane). For an Adventure-document ref, this imports the WHOLE Adventure entry\'s scene set in one batch (never just the one scene) so cross-scene references (e.g. a region teleport to a sibling floor) resolve, then imports any actors the scene\'s tokens need from other Adventure documents in the same module (or a module it requires). Idempotent: a repeat call for a scene already adopted from this pack returns it unchanged rather than re-importing. Provide the package id and the scene "ref" string exactly as returned by list-installed-packages. Returns {success, scene_id, scene_name, reused, imported:{scenes,actors}, unresolved:{scene_refs,actor_ids}, error}; success is false if anything is still unresolved, with error naming it.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -166,6 +166,21 @@ export class SceneManagementTools {
             },
           },
           required: ['package', 'scene_ref'],
+        },
+      },
+      {
+        name: 'scene-integrity',
+        description:
+          "Read-only check of a scene already in the world: walks its regions/behaviors for unresolved Scene-uuid references and diffs its tokens' actorIds against game.actors, WITHOUT importing or creating anything. Use this to check a world that was built before this fix, or as a standing gate. Returns the same {success, scene_id, scene_name, unresolved:{scene_refs,actor_ids}, error} shape as adventure-import (reused is always true, imported is always empty since nothing is imported).",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            scene_id: { type: 'string', description: 'Exact scene id to check.' },
+            scene_identifier: {
+              type: 'string',
+              description: 'Scene name or id to locate the scene, if "scene_id" is not given.',
+            },
+          },
         },
       },
     ];
@@ -202,6 +217,13 @@ export class SceneManagementTools {
     return await this.foundryClient.query('foundry-mcp-bridge.adventure-import', {
       package: args?.package,
       scene_ref: args?.scene_ref,
+    });
+  }
+
+  async handleSceneIntegrity(args: any): Promise<any> {
+    return await this.foundryClient.query('foundry-mcp-bridge.scene-integrity', {
+      scene_id: args?.scene_id,
+      scene_identifier: args?.scene_identifier,
     });
   }
 }

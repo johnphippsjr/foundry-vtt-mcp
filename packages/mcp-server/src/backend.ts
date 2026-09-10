@@ -1807,6 +1807,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'scene-integrity':
+                  result = await sceneManagementTools.handleSceneIntegrity(args);
+
+                  break;
+
                 // Wall/lighting tools (Phase E)
 
                 case 'walls-create':

@@ -1,6 +1,6 @@
 {
   "name": "@foundry-mcp/module",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Foundry VTT module for MCP bridge integration",
   "type": "module",
   "scripts": {
@@ -8,7 +8,8 @@
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
-    "lint:fix": "eslint src --ext .ts --fix"
+    "lint:fix": "eslint src --ext .ts --fix",
+    "test": "vitest run"
   },
   "dependencies": {
     "socket.io-client": "^4.7.0"
@@ -16,7 +17,8 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0",
-    "@league-of-foundry-developers/foundry-vtt-types": "^9.280.0"
+    "@league-of-foundry-developers/foundry-vtt-types": "^9.280.0",
+    "vitest": "^3.2.4"
   },
   "files": [
     "dist",
