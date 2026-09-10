@@ -7,6 +7,11 @@ import {
   moduleSearchScope,
   summarizeUnresolved,
 } from './adventure-import-utils.js';
+import {
+  selectDefaultCombatants,
+  formatScopingSummary,
+  type CombatToken,
+} from './combat-scoping-utils.js';
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
@@ -2170,17 +2175,132 @@ export class QueryHandlers {
     const lower = String(ref).toLowerCase();
     return scene.tokens.find((t: any) => t.name?.toLowerCase() === lower);
   }
-  private async handleStartCombat(data: { tokens?: string[] }): Promise<any> {
+  /**
+   * Converts a live placed token into the plain, Foundry-global-free shape
+   * combat-scoping-utils.ts's pure selector operates on (board #1311 bridge fix 0006).
+   */
+  private _asCombatToken(t: any): CombatToken {
+    return {
+      id: t.id,
+      name: t.name,
+      actorId: t.actorId,
+      actorType: t.actor?.type,
+      disposition: typeof t.disposition === 'number' ? t.disposition : t.document?.disposition,
+      hidden: !!t.hidden,
+    };
+  }
+
+  /**
+   * The default start-combat scope (board #1311 bridge fix 0006): never "every token on the
+   * scene". Computes party + admitted-hostile live tokens plus a plain scoping summary, by
+   * handing the pure selectDefaultCombatants() the scene's own Region containment
+   * (Region#testPoint, the same API _resolveSceneRefs already reads scene.regions with) and
+   * Foundry's own wall-collision sight test (CONFIG.Canvas.polygonBackends.sight.testCollision --
+   * canvas.walls has no checkCollision method in v13.351) as injected accessor functions.
+   * Assumptions this rests on, and their failure modes for an adventure nobody has tested yet:
+   *  - Party tokens are Actor.type "character" (or explicitly named via `partyRefs`) -- an
+   *    adventure whose PCs use a non-"character" actor type would need the `party` field passed.
+   *  - Hostile intent is expressed as TOKEN_DISPOSITIONS.HOSTILE (-1) on the token, the same field
+   *    the adventure/module author already sets -- an author who leaves monsters at NEUTRAL (0)
+   *    gets none of them auto-added (they are simply never candidates; explicit `tokens` still
+   *    works for that case).
+   *  - Region-mode requires the scene to actually have Region documents the party stands inside;
+   *    a scene authored without Regions (or where the party is in an untagged corridor) falls back
+   *    to line-of-sight automatically -- never silently misapplies room-scoping to a roomless map.
+   *  - If CONFIG.Canvas.polygonBackends.sight.testCollision is ever renamed/removed in a future
+   *    Foundry version, hasLineOfSight fails closed (returns false) rather than throwing or
+   *    silently reverting to "everything on the scene" -- the visible symptom would be zero
+   *    hostiles auto-joining on a roomless map, never the old over-inclusion bug.
+   */
+  private _defaultCombatScope(
+    scene: any,
+    partyRefs?: string[]
+  ): { liveTokens: any[]; summary: ReturnType<typeof formatScopingSummary> } {
+    const allTokens: any[] = scene.tokens.contents;
+    const combatTokens = allTokens.map((t: any) => this._asCombatToken(t));
+    const byId = new Map(allTokens.map((t: any) => [t.id, t]));
+
+    const regionsArr: any[] = Array.from((scene?.regions as any) ?? []);
+    const regionsExistOnScene = regionsArr.length > 0;
+
+    const placeableFor = (id: string): any =>
+      (canvas as any)?.tokens?.get?.(id) ??
+      (canvas as any)?.tokens?.placeables?.find((p: any) => p.id === id);
+
+    const pointFor = (id: string): { x: number; y: number; elevation: number } | null => {
+      const p = placeableFor(id);
+      if (!p) return null;
+      const c = p.center || { x: p.x, y: p.y };
+      return { x: c.x, y: c.y, elevation: p.document?.elevation ?? 0 };
+    };
+
+    const tokenRegionIds = (t: CombatToken): string[] => {
+      if (!regionsExistOnScene) return [];
+      const pt = pointFor(t.id);
+      if (!pt) return [];
+      const ids: string[] = [];
+      for (const region of regionsArr) {
+        try {
+          if ((region as any).testPoint?.(pt)) ids.push(region.id);
+        } catch (e) {
+          // A malformed region shape must not fail the whole scope; skip just that region.
+        }
+      }
+      return ids;
+    };
+
+    const hasLineOfSight = (a: CombatToken, b: CombatToken): boolean => {
+      const pa = pointFor(a.id);
+      const pb = pointFor(b.id);
+      if (!pa || !pb) return false;
+      try {
+        const backend = (CONFIG as any).Canvas?.polygonBackends?.sight;
+        if (!backend?.testCollision) return false; // API unavailable: fail closed, never over-include
+        const blocked = backend.testCollision(pa, pb, { type: 'sight', mode: 'any' });
+        return !blocked;
+      } catch (e) {
+        return false; // collision test errored: fail closed, never over-include
+      }
+    };
+
+    const resolveRef = (ref: string): string | undefined => {
+      const byIdMatch = combatTokens.find((t: CombatToken) => t.id === ref);
+      if (byIdMatch) return byIdMatch.id;
+      const lower = ref.toLowerCase();
+      return combatTokens.find((t: CombatToken) => t.name?.toLowerCase() === lower)?.id;
+    };
+
+    const result = selectDefaultCombatants(combatTokens, {
+      ...(partyRefs !== undefined ? { explicitPartyRefs: partyRefs } : {}),
+      resolveRef,
+      regionsExistOnScene,
+      tokenRegionIds,
+      hasLineOfSight,
+    });
+
+    const liveTokens = [...result.party, ...result.admitted]
+      .map((t: CombatToken) => byId.get(t.id))
+      .filter(Boolean);
+
+    return { liveTokens, summary: formatScopingSummary(result) };
+  }
+
+  private async handleStartCombat(data: { tokens?: string[]; party?: string[] }): Promise<any> {
     const gm = this.validateGMAccess();
     if (!gm.allowed) return { error: 'Access denied', success: false };
     const scene = this._activeScene();
     let combat = (game as any).combat;
     if (!combat)
       combat = await (game as any).combats.documentClass.create({ scene: scene.id, active: true });
-    const toks =
-      data.tokens && data.tokens.length
-        ? data.tokens.map((r: string) => this._findToken(scene, r)).filter(Boolean)
-        : scene.tokens.contents;
+    let toks: any[];
+    let scoping: ReturnType<typeof formatScopingSummary> | undefined;
+    if (data.tokens && data.tokens.length) {
+      toks = data.tokens.map((r: string) => this._findToken(scene, r)).filter(Boolean);
+    } else {
+      const scoped = this._defaultCombatScope(scene, data.party);
+      toks = scoped.liveTokens;
+      scoping = scoped.summary;
+    }
     const toAdd = toks
       .filter((t: any) => !combat.combatants.find((c: any) => c.tokenId === t.id))
       .map((t: any) => ({ tokenId: t.id, sceneId: scene.id, actorId: t.actorId }));
@@ -2191,6 +2311,7 @@ export class QueryHandlers {
       success: true,
       round: combat.round,
       combatants: combat.turns.map((c: any) => ({ name: c.name, initiative: c.initiative })),
+      ...(scoping ? { scoping } : {}),
     };
   }
   private async handleEndCombat(): Promise<any> {

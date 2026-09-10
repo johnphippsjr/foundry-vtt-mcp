@@ -34,14 +34,20 @@ export class CombatTools {
       {
         name: 'start-combat',
         description:
-          'Begin a combat encounter on the active scene. Adds the given tokens (by name or id) as combatants and rolls initiative; if no tokens are given, adds all tokens on the scene. Returns the initiative order.',
+          "Begin a combat encounter on the active scene. Adds the given tokens (by name or id) as combatants and rolls initiative. If no tokens are given, adds the party (character-type actors, or the tokens named in 'party') plus hostile, non-hidden tokens that share a Scene Region with the party, or, when the party is not standing inside any region, are within unobstructed line of sight of the party (Foundry's own wall-collision test) -- never all tokens on the scene, so a monster pre-placed in another room never joins by default. Returns the initiative order, and for the automatic case, a scoping report of which tokens were admitted and which hostiles were excluded and why (hidden, out of room, or no line of sight).",
         inputSchema: {
           type: 'object',
           properties: {
             tokens: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Token names or ids to add to combat. Omit to add all tokens on the scene.',
+              description: 'Token names or ids to add to combat. Omit to use the automatic party-plus-nearby-hostiles scope.',
+            },
+            party: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                "Token names or ids to treat as the party when computing the automatic scope (only used when 'tokens' is omitted). Omit to auto-detect the party as every character-type actor's token.",
             },
           },
         },
@@ -84,7 +90,12 @@ export class CombatTools {
   }
 
   async handleStartCombat(args: any) {
-    return this.wrap(await this.foundryClient.query('foundry-mcp-bridge.startCombat', { tokens: args?.tokens }));
+    return this.wrap(
+      await this.foundryClient.query('foundry-mcp-bridge.startCombat', {
+        tokens: args?.tokens,
+        party: args?.party,
+      })
+    );
   }
   async handleEndCombat(_args: any) {
     return this.wrap(await this.foundryClient.query('foundry-mcp-bridge.endCombat', {}));
