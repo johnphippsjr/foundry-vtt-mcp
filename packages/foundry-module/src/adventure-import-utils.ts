@@ -135,3 +135,55 @@ export function moduleSearchScope(primaryPack: any, readModule: (id: string) => 
   }
   return scope;
 }
+
+/**
+ * Read one key out of a document's `flags.aidm` namespace as a plain property -- never through
+ * the getFlag flag-accessor method with scope "aidm" (board #1311, bridge/README.md 0007 entry).
+ *
+ * Foundry's Document flag-accessor methods (common/abstract/document.mjs) look up
+ * `this.constructor.database.getFlagScopes()` and throw `Flag scope "<scope>" is not valid or
+ * not currently active` for any scope that is not the id of an active package: a module, the
+ * game system, "core", or "world". "aidm" is this lane's own flag namespace -- it is not a
+ * package -- so calling a flag-accessor method with "aidm" as the scope argument throws
+ * unconditionally on every call, on every world, regardless of what is stored under flags.aidm.
+ * Foundry does not scope-check a plain property read/write, which is why every other writer in
+ * this lane already reads/writes flags.aidm this way (e.g. scene.update({"flags.aidm.sourcePack":
+ * ...}) / scene.flags?.aidm?.sourcePack) instead of the flag-accessor methods.
+ */
+export function readAidmFlag(doc: any, key: string): any {
+  return doc?.flags?.aidm?.[key];
+}
+
+/**
+ * True if `doc` already carries the aidm idempotency tags for this exact pack + source scene id,
+ * read via readAidmFlag (never a flag-accessor method). Used to short-circuit a repeat
+ * adventure-import call for a scene that was already adopted, and to skip re-tagging a sibling
+ * scene that a prior call already tagged.
+ */
+export function isAdoptedFrom(doc: any, sourcePack: string, sourceSceneId: string): boolean {
+  return (
+    readAidmFlag(doc, 'sourcePack') === sourcePack &&
+    readAidmFlag(doc, 'sourceSceneId') === sourceSceneId
+  );
+}
+
+/**
+ * Builds the dotted-path update payload for writing the aidm idempotency tags
+ * (sourcePack/sourceSceneId/adoptedFor), for callers to pass straight to
+ * `document.update(aidmTagUpdatePayload(...))` -- never the setFlag flag-accessor method with
+ * scope "aidm" (same scope restriction as readAidmFlag above). Foundry's own dotted-path
+ * flattening inside `update()` merges these into any existing `flags` object without disturbing
+ * sibling keys under other namespaces, matching the merge semantics the setFlag accessor would
+ * have provided if it were usable here.
+ */
+export function aidmTagUpdatePayload(tags: {
+  sourcePack: string;
+  sourceSceneId: string;
+  adoptedFor: string;
+}): Record<string, string> {
+  return {
+    'flags.aidm.sourcePack': tags.sourcePack,
+    'flags.aidm.sourceSceneId': tags.sourceSceneId,
+    'flags.aidm.adoptedFor': tags.adoptedFor,
+  };
+}

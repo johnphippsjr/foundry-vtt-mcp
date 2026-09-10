@@ -14,6 +14,9 @@ import {
   packModuleId,
   summarizeUnresolved,
   moduleSearchScope,
+  readAidmFlag,
+  isAdoptedFrom,
+  aidmTagUpdatePayload,
 } from './adventure-import-utils.js';
 
 describe('looksLikeSceneUuid', () => {
@@ -190,5 +193,96 @@ describe('summarizeUnresolved', () => {
       ['a']
     );
     expect(msg).toBeTruthy();
+  });
+});
+
+// board #1311 bridge fix 0007: adventure-import crashed on every call because it read/wrote
+// flags.aidm through the getFlag/setFlag flag-accessor methods, and Foundry's Document flag
+// accessors throw for any scope that is not the id of an active package ("aidm" is this lane's
+// own flag namespace, not a package). readAidmFlag/isAdoptedFrom/aidmTagUpdatePayload replace
+// every accessor call with a plain property read and an update() payload builder -- these never
+// touch a live Document, so they are testable with a plain object standing in for one.
+describe('readAidmFlag', () => {
+  it('reads a key out of flags.aidm', () => {
+    const doc = {
+      flags: { aidm: { sourcePack: 'Adventure.deathhouse', sourceSceneId: 'abc123' } },
+    };
+    expect(readAidmFlag(doc, 'sourcePack')).toBe('Adventure.deathhouse');
+    expect(readAidmFlag(doc, 'sourceSceneId')).toBe('abc123');
+  });
+
+  it('returns undefined when the document has no flags, no aidm namespace, or no such key', () => {
+    expect(readAidmFlag({}, 'sourcePack')).toBeUndefined();
+    expect(readAidmFlag({ flags: {} }, 'sourcePack')).toBeUndefined();
+    expect(readAidmFlag({ flags: { aidm: {} } }, 'sourcePack')).toBeUndefined();
+    expect(readAidmFlag(null, 'sourcePack')).toBeUndefined();
+    expect(readAidmFlag(undefined, 'sourcePack')).toBeUndefined();
+  });
+
+  it('never throws for a document shape a real Foundry Document.getFlag would reject', () => {
+    // A plain object is not a Foundry Document at all (no constructor.database), which is
+    // exactly the case that proves this never delegates to the throwing accessor.
+    expect(() => readAidmFlag({ flags: { aidm: { x: 1 } } }, 'x')).not.toThrow();
+  });
+});
+
+describe('isAdoptedFrom', () => {
+  const tagged = {
+    flags: {
+      aidm: {
+        sourcePack: 'Adventure.deathhouse',
+        sourceSceneId: 'srcScene1',
+        adoptedFor: 'srcScene1',
+      },
+    },
+  };
+
+  it('true only when both sourcePack and sourceSceneId match exactly', () => {
+    expect(isAdoptedFrom(tagged, 'Adventure.deathhouse', 'srcScene1')).toBe(true);
+  });
+
+  it('false when the pack differs', () => {
+    expect(isAdoptedFrom(tagged, 'Adventure.other', 'srcScene1')).toBe(false);
+  });
+
+  it('false when the source scene id differs', () => {
+    expect(isAdoptedFrom(tagged, 'Adventure.deathhouse', 'srcScene2')).toBe(false);
+  });
+
+  it('false for an untagged document', () => {
+    expect(isAdoptedFrom({}, 'Adventure.deathhouse', 'srcScene1')).toBe(false);
+    expect(isAdoptedFrom({ flags: {} }, 'Adventure.deathhouse', 'srcScene1')).toBe(false);
+  });
+});
+
+describe('aidmTagUpdatePayload', () => {
+  it('builds a dotted-path payload for document.update(), one key per tag', () => {
+    const payload = aidmTagUpdatePayload({
+      sourcePack: 'Adventure.deathhouse',
+      sourceSceneId: 'srcScene1',
+      adoptedFor: 'targetScene1',
+    });
+    expect(payload).toEqual({
+      'flags.aidm.sourcePack': 'Adventure.deathhouse',
+      'flags.aidm.sourceSceneId': 'srcScene1',
+      'flags.aidm.adoptedFor': 'targetScene1',
+    });
+  });
+
+  it('the payload round-trips through readAidmFlag once merged into a flags object', () => {
+    // Simulates what Foundry's own dotted-path flattening inside update() does: merge each
+    // "flags.aidm.<key>" entry into the document's flags.aidm object.
+    const payload = aidmTagUpdatePayload({
+      sourcePack: 'Adventure.lmop',
+      sourceSceneId: 'srcScene9',
+      adoptedFor: 'srcScene9',
+    });
+    const doc: any = { flags: {} };
+    for (const [dottedKey, value] of Object.entries(payload)) {
+      const [, , key] = dottedKey.split('.');
+      doc.flags.aidm = { ...(doc.flags.aidm || {}), [key as string]: value };
+    }
+    expect(readAidmFlag(doc, 'sourcePack')).toBe('Adventure.lmop');
+    expect(isAdoptedFrom(doc, 'Adventure.lmop', 'srcScene9')).toBe(true);
   });
 });

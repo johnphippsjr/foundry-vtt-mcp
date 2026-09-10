@@ -6,6 +6,8 @@ import {
   packModuleId,
   moduleSearchScope,
   summarizeUnresolved,
+  isAdoptedFrom,
+  aidmTagUpdatePayload,
 } from './adventure-import-utils.js';
 import {
   selectDefaultCombatants,
@@ -3101,13 +3103,7 @@ export class QueryHandlers {
   // for a different scene in the same Adventure entry) bind to it without re-importing anything.
   private _findAdoptedScene(sourcePack: string, sourceSceneId: string): any {
     const scenes: any[] = Array.from(((game as any).scenes as any) ?? []);
-    return (
-      scenes.find(
-        (s: any) =>
-          s.getFlag?.('aidm', 'sourcePack') === sourcePack &&
-          s.getFlag?.('aidm', 'sourceSceneId') === sourceSceneId
-      ) || null
-    );
+    return scenes.find((s: any) => isAdoptedFrom(s, sourcePack, sourceSceneId)) || null;
   }
 
   private async _finalizeAdventureImportResult(opts: {
@@ -3213,9 +3209,13 @@ export class QueryHandlers {
         );
       }
       void importResult;
-      await worldScene.setFlag('aidm', 'sourcePack', packCollection);
-      await worldScene.setFlag('aidm', 'sourceSceneId', sceneId);
-      await worldScene.setFlag('aidm', 'adoptedFor', sceneId);
+      await worldScene.update(
+        aidmTagUpdatePayload({
+          sourcePack: packCollection,
+          sourceSceneId: sceneId,
+          adoptedFor: sceneId,
+        })
+      );
       return await this._finalizeAdventureImportResult({
         targetScene: worldScene,
         allScenes: [worldScene],
@@ -3251,13 +3251,15 @@ export class QueryHandlers {
       if (!ws) continue; // Foundry did not end up creating/updating this one -- surfaces below as
       // a dangling reference if anything imported points at it.
       worldScenes.push(ws);
-      const alreadyTagged =
-        ws.getFlag?.('aidm', 'sourcePack') === packCollection &&
-        ws.getFlag?.('aidm', 'sourceSceneId') === srcId;
+      const alreadyTagged = isAdoptedFrom(ws, packCollection, srcId);
       if (!alreadyTagged) {
-        await ws.setFlag('aidm', 'sourcePack', packCollection);
-        await ws.setFlag('aidm', 'sourceSceneId', srcId);
-        await ws.setFlag('aidm', 'adoptedFor', sceneId);
+        await ws.update(
+          aidmTagUpdatePayload({
+            sourcePack: packCollection,
+            sourceSceneId: srcId,
+            adoptedFor: sceneId,
+          })
+        );
       }
       if (toCreateIds.has(srcId)) importedSceneIds.push(srcId);
     }
