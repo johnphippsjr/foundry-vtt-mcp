@@ -8,6 +8,10 @@ import {
   summarizeUnresolved,
   isAdoptedFrom,
   aidmTagUpdatePayload,
+  collectCreatedDocuments,
+  summarizeCleanup,
+  type CreatedDocRef,
+  type CleanupReport,
 } from './adventure-import-utils.js';
 import {
   selectDefaultCombatants,
@@ -3106,17 +3110,57 @@ export class QueryHandlers {
     return scenes.find((s: any) => isAdoptedFrom(s, sourcePack, sourceSceneId)) || null;
   }
 
+  // Deletes every document in `created` in REVERSE order of creation (board #1311): when
+  // adventure-import is about to report success:false, it is the only party that knows precisely
+  // which documents it made during THIS call, so it is the one responsible for leaving nothing
+  // half-imported behind for a user to clean up by hand. Never touches a reused/already-adopted
+  // document -- `created` only ever holds ids this same call actually created (see
+  // _importAdventureScene / _importStandaloneScene / _resolveActors), never anything found via
+  // _findAdoptedScene. One document at a time, each independently try/caught, so a failure
+  // deleting one document never stops the rest from being attempted, and every outcome -- deleted
+  // or not -- is reported by id rather than collapsed into a single pass/fail flag.
+  private async _rollbackCreatedDocuments(created: CreatedDocRef[]): Promise<CleanupReport> {
+    const attempts: { type: string; id: string; ok: boolean; error?: string }[] = [];
+    for (const doc of created.slice().reverse()) {
+      try {
+        const Cls: any = (globalThis as any)[doc.type];
+        if (!Cls) {
+          throw new Error(`No document class "${doc.type}" available to delete it with`);
+        }
+        const impl = Cls.implementation ?? Cls;
+        await impl.deleteDocuments([doc.id]);
+        attempts.push({ type: doc.type, id: doc.id, ok: true });
+      } catch (e: any) {
+        attempts.push({
+          type: doc.type,
+          id: doc.id,
+          ok: false,
+          error: String((e && (e.stack || e.message)) || e),
+        });
+      }
+    }
+    return summarizeCleanup(attempts);
+  }
+
   private async _finalizeAdventureImportResult(opts: {
     targetScene: any;
     allScenes: any[];
     reused: boolean;
     importedSceneIds: string[];
     pack: any;
+    createdDocs: CreatedDocRef[];
   }): Promise<any> {
     const unresolvedSceneRefs = await this._resolveSceneRefs(opts.allScenes);
     const actorResult = await this._resolveActors(opts.allScenes, opts.pack);
     const success = unresolvedSceneRefs.length === 0 && actorResult.unresolvedActorIds.length === 0;
-    return {
+    // Everything this call created: the tracked scene/etc. creations from opts.createdDocs, plus
+    // the actors _resolveActors just created (appended, not re-derived -- _resolveActors already
+    // knows exactly which ids it made via createDocuments and reports them in importedActorIds).
+    const allCreated: CreatedDocRef[] = [
+      ...opts.createdDocs,
+      ...actorResult.importedActorIds.map(id => ({ type: 'Actor', id })),
+    ];
+    const result: any = {
       success,
       scene_id: opts.targetScene.id,
       scene_name: opts.targetScene.name,
@@ -3125,6 +3169,10 @@ export class QueryHandlers {
       unresolved: { scene_refs: unresolvedSceneRefs, actor_ids: actorResult.unresolvedActorIds },
       error: summarizeUnresolved(unresolvedSceneRefs, actorResult.unresolvedActorIds),
     };
+    if (!success && allCreated.length) {
+      result.cleanup = await this._rollbackCreatedDocuments(allCreated);
+    }
+    return result;
   }
 
   private async _importStandaloneScene(parts: string[]): Promise<any> {
@@ -3141,6 +3189,7 @@ export class QueryHandlers {
         reused: true,
         importedSceneIds: [],
         pack,
+        createdDocs: [], // reused: nothing created this call, so nothing to ever roll back
       });
     }
 
@@ -3166,6 +3215,7 @@ export class QueryHandlers {
       reused: false,
       importedSceneIds: [sceneId],
       pack,
+      createdDocs: [{ type: 'Scene', id: created.id }],
     });
   }
 
@@ -3184,6 +3234,7 @@ export class QueryHandlers {
         reused: true,
         importedSceneIds: [],
         pack,
+        createdDocs: [], // reused: nothing created this call, so nothing to ever roll back
       });
     }
 
@@ -3216,12 +3267,21 @@ export class QueryHandlers {
           adoptedFor: sceneId,
         })
       );
+      // Known limitation of this legacy fallback only (not the normal path below): adv.import()
+      // is an opaque single call with no created-documents result to read, unlike importContent's
+      // AdventureImportResult -- so only the one scene we can concretely confirm (worldScene) is
+      // tracked for rollback here. Any actors/items/journals/folders that call also created are
+      // not tracked and will NOT be rolled back on an unresolved reference -- this code refuses to
+      // guess at ids it was never told. This branch only runs against a Foundry core old enough to
+      // lack prepareImport/importContent, which the deployed v13.351 world is not (see the
+      // "Newer core" branch below, the one actually exercised live).
       return await this._finalizeAdventureImportResult({
         targetScene: worldScene,
         allScenes: [worldScene],
         reused: false,
         importedSceneIds: [sceneId],
         pack,
+        createdDocs: [{ type: 'Scene', id: worldScene.id }],
       });
     }
 
@@ -3241,7 +3301,13 @@ export class QueryHandlers {
       );
     }
 
-    await adv.importContent(toImport);
+    // importContent's own AdventureImportResult ({created, updated}, each Record<documentName,
+    // Document[]> -- foundry.documents.types.AdventureImportResult) is this call's OWN record of
+    // exactly what it made, read directly rather than inferred afterward by diffing world state.
+    // Tracked BEFORE anything else can fail below, so a later unresolved reference or missing
+    // actor always has the true creation list to roll back, never a guess.
+    const importResult: any = await adv.importContent(toImport);
+    const createdDocs: CreatedDocRef[] = collectCreatedDocuments(importResult?.created);
 
     const allSourceIds = new Set<string>([...toCreateIds, ...toUpdateIds]);
     const worldScenes: any[] = [];
@@ -3277,6 +3343,7 @@ export class QueryHandlers {
       reused: false,
       importedSceneIds,
       pack,
+      createdDocs,
     });
   }
 

@@ -187,3 +187,69 @@ export function aidmTagUpdatePayload(tags: {
     'flags.aidm.adoptedFor': tags.adoptedFor,
   };
 }
+
+/** One document `adventure-import` created in the current call, tracked as it happens. */
+export interface CreatedDocRef {
+  /** Foundry document name, e.g. "Scene", "Actor", "JournalEntry", "Item", "Folder". */
+  type: string;
+  id: string;
+}
+
+/**
+ * Flattens `Adventure#importContent`'s own `created` result (`Record<documentName, Document[]>`,
+ * per the official v13 API: foundry.documents.types.AdventureImportResult) into an ordered
+ * `{type, id}` list, preserving both the object's key order and each array's order -- this is the
+ * import call's OWN record of exactly what it made, not something inferred afterward by diffing
+ * world state. Generic over whatever document names `created` carries: today `adventure-import`
+ * only requests `documentTypes: ['Scene']` so only a "Scene" key is ever present, but this makes
+ * no assumption about that -- if a future caller widens `documentTypes` to include Actor, Item,
+ * JournalEntry, or Folder, those creations are tracked the same way with no code change here.
+ * Entries with no usable id (`id`/`_id` both missing) are skipped rather than pushed as `undefined`.
+ */
+export function collectCreatedDocuments(
+  created: Record<string, Array<{ id?: string; _id?: string }>> | null | undefined
+): CreatedDocRef[] {
+  const out: CreatedDocRef[] = [];
+  for (const [type, docs] of Object.entries(created ?? {})) {
+    for (const doc of docs ?? []) {
+      const id = doc?.id ?? doc?._id;
+      if (id) out.push({ type, id });
+    }
+  }
+  return out;
+}
+
+/** The outcome of attempting to delete one previously-created document during rollback. */
+export interface CleanupAttempt {
+  type: string;
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/** `adventure-import`'s `cleanup` reply field: what rollback actually managed to remove. */
+export interface CleanupReport {
+  deleted: CreatedDocRef[];
+  failed: { id: string; type: string; error: string }[];
+}
+
+/**
+ * Turns a list of individual delete attempts (one per document, already run in reverse creation
+ * order by the caller) into the `cleanup` reply shape: every document that deleted cleanly under
+ * `deleted`, and every one that did not -- by id, with its own error -- under `failed`, rather
+ * than collapsing a partial failure into one generic message. A caller that only sees `deleted`
+ * would not know which specific document (if any) a user still has to remove by hand; this keeps
+ * that list explicit so a partial cleanup is never reported as if it were a tidy one.
+ */
+export function summarizeCleanup(attempts: CleanupAttempt[]): CleanupReport {
+  const deleted: CreatedDocRef[] = [];
+  const failed: { id: string; type: string; error: string }[] = [];
+  for (const a of attempts) {
+    if (a.ok) {
+      deleted.push({ type: a.type, id: a.id });
+    } else {
+      failed.push({ id: a.id, type: a.type, error: a.error || 'unknown error' });
+    }
+  }
+  return { deleted, failed };
+}

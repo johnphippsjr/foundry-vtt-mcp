@@ -17,6 +17,8 @@ import {
   readAidmFlag,
   isAdoptedFrom,
   aidmTagUpdatePayload,
+  collectCreatedDocuments,
+  summarizeCleanup,
 } from './adventure-import-utils.js';
 
 describe('looksLikeSceneUuid', () => {
@@ -284,5 +286,109 @@ describe('aidmTagUpdatePayload', () => {
     }
     expect(readAidmFlag(doc, 'sourcePack')).toBe('Adventure.lmop');
     expect(isAdoptedFrom(doc, 'Adventure.lmop', 'srcScene9')).toBe(true);
+  });
+});
+
+// Board #1311, worker fix-bridge-import-rollback: on any unresolved reference or actor,
+// adventure-import must delete everything IT created during that same call rather than leaving
+// half-imported scenes behind for a user to find and delete by hand. collectCreatedDocuments and
+// summarizeCleanup are the pure pieces of that: turning Adventure#importContent's own
+// {created: Record<documentName, Document[]>} result into a flat tracked list, and turning a list
+// of individual delete attempts into the {deleted, failed} reply shape.
+describe('collectCreatedDocuments', () => {
+  it('flattens a single document type, preserving array order', () => {
+    const created = { Scene: [{ id: 'sceneA' }, { id: 'sceneB' }] };
+    expect(collectCreatedDocuments(created)).toEqual([
+      { type: 'Scene', id: 'sceneA' },
+      { type: 'Scene', id: 'sceneB' },
+    ]);
+  });
+
+  it('flattens multiple document types, preserving key order (generic over any type name)', () => {
+    // Nothing here is specific to Scene/Actor -- a future documentTypes list that also creates
+    // JournalEntry/Item/Folder is tracked exactly the same way with no code change.
+    const created = {
+      Scene: [{ id: 'sceneA' }],
+      JournalEntry: [{ id: 'journalA' }],
+      Folder: [{ id: 'folderA' }, { id: 'folderB' }],
+    };
+    expect(collectCreatedDocuments(created)).toEqual([
+      { type: 'Scene', id: 'sceneA' },
+      { type: 'JournalEntry', id: 'journalA' },
+      { type: 'Folder', id: 'folderA' },
+      { type: 'Folder', id: 'folderB' },
+    ]);
+  });
+
+  it('falls back to _id when a document lacks a getter-backed id field', () => {
+    expect(collectCreatedDocuments({ Actor: [{ _id: 'actorA' }] })).toEqual([
+      { type: 'Actor', id: 'actorA' },
+    ]);
+  });
+
+  it('skips an entry with no usable id rather than pushing undefined', () => {
+    expect(collectCreatedDocuments({ Scene: [{ id: 'sceneA' }, {}] })).toEqual([
+      { type: 'Scene', id: 'sceneA' },
+    ]);
+  });
+
+  it('returns an empty list for null, undefined, or an empty record', () => {
+    expect(collectCreatedDocuments(null)).toEqual([]);
+    expect(collectCreatedDocuments(undefined)).toEqual([]);
+    expect(collectCreatedDocuments({})).toEqual([]);
+  });
+});
+
+describe('summarizeCleanup', () => {
+  it('every successful attempt lands under deleted, none under failed', () => {
+    const report = summarizeCleanup([
+      { type: 'Actor', id: 'actorA', ok: true },
+      { type: 'Scene', id: 'sceneB', ok: true },
+      { type: 'Scene', id: 'sceneA', ok: true },
+    ]);
+    expect(report).toEqual({
+      deleted: [
+        { type: 'Actor', id: 'actorA' },
+        { type: 'Scene', id: 'sceneB' },
+        { type: 'Scene', id: 'sceneA' },
+      ],
+      failed: [],
+    });
+  });
+
+  it('a partial cleanup failure is reported BY ID, not collapsed into one generic failure', () => {
+    const report = summarizeCleanup([
+      { type: 'Actor', id: 'actorA', ok: true },
+      { type: 'Scene', id: 'sceneB', ok: false, error: 'Scene.sceneB does not exist' },
+      { type: 'Scene', id: 'sceneA', ok: true },
+    ]);
+    expect(report.deleted).toEqual([
+      { type: 'Actor', id: 'actorA' },
+      { type: 'Scene', id: 'sceneA' },
+    ]);
+    expect(report.failed).toEqual([
+      { id: 'sceneB', type: 'Scene', error: 'Scene.sceneB does not exist' },
+    ]);
+  });
+
+  it('every attempt failing still reports each one individually, never a single flag', () => {
+    const report = summarizeCleanup([
+      { type: 'Scene', id: 'sceneB', ok: false, error: 'permission denied' },
+      { type: 'Scene', id: 'sceneA', ok: false, error: 'network error' },
+    ]);
+    expect(report.deleted).toEqual([]);
+    expect(report.failed).toEqual([
+      { id: 'sceneB', type: 'Scene', error: 'permission denied' },
+      { id: 'sceneA', type: 'Scene', error: 'network error' },
+    ]);
+  });
+
+  it('a missing error message falls back to a non-empty placeholder, never blank', () => {
+    const report = summarizeCleanup([{ type: 'Scene', id: 'sceneA', ok: false }]);
+    expect(report.failed[0].error).toBe('unknown error');
+  });
+
+  it('an empty attempt list reports an empty, well-formed report', () => {
+    expect(summarizeCleanup([])).toEqual({ deleted: [], failed: [] });
   });
 });

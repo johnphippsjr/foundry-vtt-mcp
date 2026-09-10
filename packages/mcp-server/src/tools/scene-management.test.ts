@@ -53,6 +53,67 @@ describe('adventure-import tool', () => {
     const result = await tools.handleAdventureImport({ package: 'p', scene_ref: 'a.b.c.d' });
     expect(result).toEqual(shape);
   });
+
+  it('forwards the cleanup field unmodified when the bridge rolled back a failed import (board #1311)', async () => {
+    // adventure-import deletes what it created before reporting success:false (see
+    // bridge/README.md's 0008 entry / queries.ts _rollbackCreatedDocuments) and reports the
+    // outcome under a `cleanup` field. This tool layer must pass that through exactly like every
+    // other field -- it has no business reshaping or dropping it.
+    const shape = {
+      success: false,
+      scene_id: 'targetScene1',
+      scene_name: 'Broken Tower',
+      reused: false,
+      imported: { scenes: ['targetScene1', 'siblingScene1'], actors: ['actorA'] },
+      unresolved: { scene_refs: [], actor_ids: ['missing1'] },
+      error: '1 unresolved actor id(s): missing1',
+      cleanup: {
+        deleted: [
+          { type: 'Actor', id: 'actorA' },
+          { type: 'Scene', id: 'siblingScene1' },
+          { type: 'Scene', id: 'targetScene1' },
+        ],
+        failed: [],
+      },
+    };
+    const { tools } = makeTools(async () => shape);
+    const result = await tools.handleAdventureImport({ package: 'p', scene_ref: 'a.b.c.d' });
+    expect(result).toEqual(shape);
+    expect(result.cleanup.deleted).toHaveLength(3);
+    expect(result.cleanup.failed).toEqual([]);
+  });
+
+  it('forwards a partially-failed cleanup unmodified, ids and errors intact', async () => {
+    const shape = {
+      success: false,
+      scene_id: 'targetScene1',
+      scene_name: 'Broken Tower',
+      reused: false,
+      imported: { scenes: ['targetScene1'], actors: [] },
+      unresolved: {
+        scene_refs: [
+          {
+            scene_id: 'targetScene1',
+            region_id: 'r1',
+            behavior_id: 'b1',
+            target: 'Scene.missingSceneId12345',
+          },
+        ],
+        actor_ids: [],
+      },
+      error:
+        '1 unresolved scene/region reference(s): Scene.missingSceneId12345 (scene targetScene1, region r1, behavior b1)',
+      cleanup: {
+        deleted: [],
+        failed: [{ id: 'targetScene1', type: 'Scene', error: 'Scene.targetScene1 does not exist' }],
+      },
+    };
+    const { tools } = makeTools(async () => shape);
+    const result = await tools.handleAdventureImport({ package: 'p', scene_ref: 'a.b.c.d' });
+    expect(result.cleanup.failed).toEqual([
+      { id: 'targetScene1', type: 'Scene', error: 'Scene.targetScene1 does not exist' },
+    ]);
+  });
 });
 
 describe('scene-integrity tool', () => {
