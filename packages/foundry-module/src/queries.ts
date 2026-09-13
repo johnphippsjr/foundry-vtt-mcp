@@ -18,6 +18,7 @@ import {
   formatScopingSummary,
   type CombatToken,
 } from './combat-scoping-utils.js';
+import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
@@ -2296,8 +2297,29 @@ export class QueryHandlers {
     if (!gm.allowed) return { error: 'Access denied', success: false };
     const scene = this._activeScene();
     let combat = (game as any).combat;
-    if (!combat)
+    if (!combat) {
+      // Board #1652: this app's model never runs more than one live fight at a time, so any
+      // Combat document still sitting in the world when none is active is a stale leftover from
+      // an earlier fight that ended without going through handleEndCombat (a crashed run, a
+      // turn-budget cutoff, a party that fled the scene). Once a combat goes inactive it can
+      // never be reached via game.combat again, so handleEndCombat's own cleanup can never
+      // delete it -- sweep every existing Combat document before starting the new one, so
+      // orphans cannot accumulate. staleCombatIdsToDelete is the pure, unit-tested rule; this is
+      // just the Foundry-touching call site (same injection pattern as combat-scoping-utils).
+      // Best-effort: a failed sweep must never block starting the fight the caller asked for.
+      const toDelete = staleCombatIdsToDelete(
+        (game as any).combats.contents.map((c: any) => c.id),
+        null
+      );
+      if (toDelete.length) {
+        try {
+          await (game as any).combats.documentClass.deleteDocuments(toDelete);
+        } catch (e) {
+          // best-effort, see comment above
+        }
+      }
       combat = await (game as any).combats.documentClass.create({ scene: scene.id, active: true });
+    }
     let toks: any[];
     let scoping: ReturnType<typeof formatScopingSummary> | undefined;
     if (data.tokens && data.tokens.length) {
@@ -2324,9 +2346,25 @@ export class QueryHandlers {
     const gm = this.validateGMAccess();
     if (!gm.allowed) return { error: 'Access denied', success: false };
     const combat = (game as any).combat;
-    if (!combat) return { success: true, note: 'no active combat' };
-    await combat.delete();
-    return { success: true };
+    if (combat) await combat.delete();
+    // Board #1652: this app's model never runs more than one live fight at a time, so ANY Combat
+    // document remaining at this point is a stale orphan -- one that already ended without going
+    // through this handler (see handleStartCombat's matching comment), or leftovers from before
+    // this fix shipped. Sweep them all every time this is called, even when there was nothing
+    // active to end, so a world that already has orphans self-heals the next time anything calls
+    // end-combat. Same pure rule + best-effort call-site pattern as handleStartCombat.
+    const toDelete = staleCombatIdsToDelete(
+      (game as any).combats.contents.map((c: any) => c.id),
+      null
+    );
+    if (toDelete.length) {
+      try {
+        await (game as any).combats.documentClass.deleteDocuments(toDelete);
+      } catch (e) {
+        // best-effort, see comment above
+      }
+    }
+    return combat ? { success: true } : { success: true, note: 'no active combat' };
   }
   private async handleNextTurn(): Promise<any> {
     const gm = this.validateGMAccess();
