@@ -36,7 +36,63 @@ describe('adventure-import tool', () => {
     expect(query).toHaveBeenCalledWith('foundry-mcp-bridge.adventure-import', {
       package: 'curse-of-strahd-by-claygolem.cos-scenes',
       scene_ref: 'Scene.curse-of-strahd-by-claygolem.cos-scenes.abc123.def456',
+      // board #1714: scenes-only by default; actor creation is opt-in and always sent explicitly
+      import_missing_actors: false,
     });
+  });
+
+  it('forwards import_missing_actors only when it is exactly true (board #1714)', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleAdventureImport({
+      package: 'p',
+      scene_ref: 'a.b.c.d',
+      import_missing_actors: true,
+    });
+    await tools.handleAdventureImport({
+      package: 'p',
+      scene_ref: 'a.b.c.d',
+      import_missing_actors: 'yes',
+    });
+    expect(query.mock.calls[0][1].import_missing_actors).toBe(true);
+    expect(query.mock.calls[1][1].import_missing_actors).toBe(false);
+  });
+
+  it('advertises import_missing_actors as an optional boolean and says it never overwrites', () => {
+    const { tools } = makeTools();
+    const def: any = tools.getToolDefinitions().find(d => d.name === 'adventure-import');
+    expect(def.inputSchema.properties.import_missing_actors.type).toBe('boolean');
+    expect(def.inputSchema.required).not.toContain('import_missing_actors');
+    expect(def.description).toContain('SCENES ONLY');
+    expect(def.description).toContain('NEVER OVERWRITES');
+    // board #1714 review: the opt-in must warn that it re-creates actors the DM deleted
+    expect(def.inputSchema.properties.import_missing_actors.description).toContain(
+      'deleted on purpose'
+    );
+    expect(def.description).toContain('deleted on purpose');
+  });
+
+  it('forwards a refusal with its conflicts list unmodified (board #1714)', async () => {
+    const shape = {
+      success: false,
+      scene_id: null,
+      scene_name: null,
+      reused: false,
+      imported: { scenes: [], actors: [] },
+      unresolved: { scene_refs: [], actor_ids: [] },
+      error: 'Refused: importing would overwrite or duplicate 1 existing world scene(s).',
+      conflicts: [
+        {
+          scene_id: 'FBot4IT6IOGsSq8A',
+          scene_name: 'Curse of Strahd: Death House',
+          reason: 'id-taken-untagged',
+          tagged_source: null,
+          world_scene_ids: ['FBot4IT6IOGsSq8A'],
+        },
+      ],
+    };
+    const { tools } = makeTools(async () => shape);
+    const result = await tools.handleAdventureImport({ package: 'p', scene_ref: 'a.b.c.d' });
+    expect(result).toEqual(shape);
   });
 
   it('returns whatever the bridge query returns, unmodified (the fixed return contract)', async () => {
@@ -139,5 +195,56 @@ describe('scene-integrity tool', () => {
     await tools.handleSceneIntegrity({ scene_id: 'abc' });
     expect(query).toHaveBeenCalledTimes(1);
     expect(query.mock.calls[0][0]).toBe('foundry-mcp-bridge.scene-integrity');
+  });
+});
+
+describe('adventure-source-backfill tool (board #1714)', () => {
+  it('is advertised with pack required and apply/plan_id optional', () => {
+    const { tools } = makeTools();
+    const def: any = tools.getToolDefinitions().find(d => d.name === 'adventure-source-backfill');
+    expect(def).toBeDefined();
+    expect(def.inputSchema.required).toEqual(['pack']);
+    expect(def.inputSchema.properties.apply.type).toBe('boolean');
+    expect(def.inputSchema.properties.plan_id.type).toBe('string');
+    expect(def.description).toContain('DRY RUN BY DEFAULT');
+    expect(def.description).toContain('no plan_id');
+  });
+
+  it('is a dry run unless apply is exactly true', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleAdventureSourceBackfill({ pack: 'm.P' });
+    await tools.handleAdventureSourceBackfill({ pack: 'm.P', apply: 'true' });
+    await tools.handleAdventureSourceBackfill({ pack: 'm.P', apply: 1 });
+    for (const call of query.mock.calls) {
+      expect(call[0]).toBe('foundry-mcp-bridge.adventure-source-backfill');
+      expect(call[1].apply).toBe(false);
+    }
+  });
+
+  it('forwards pack, scene_ids, apply and plan_id', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleAdventureSourceBackfill({
+      pack: 'm.P',
+      scene_ids: ['a', 'b'],
+      apply: true,
+      plan_id: 'bf-2-deadbeef',
+    });
+    expect(query).toHaveBeenCalledWith('foundry-mcp-bridge.adventure-source-backfill', {
+      pack: 'm.P',
+      scene_ids: ['a', 'b'],
+      apply: true,
+      plan_id: 'bf-2-deadbeef',
+    });
+  });
+
+  it('accepts package as another name for pack, and drops a non-array scene_ids', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleAdventureSourceBackfill({ package: 'm.P:advId', scene_ids: 'a' });
+    expect(query.mock.calls[0][1]).toEqual({
+      pack: 'm.P:advId',
+      scene_ids: undefined,
+      apply: false,
+      plan_id: undefined,
+    });
   });
 });

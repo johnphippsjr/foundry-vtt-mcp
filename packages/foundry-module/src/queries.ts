@@ -10,15 +10,41 @@ import {
   aidmTagUpdatePayload,
   collectCreatedDocuments,
   summarizeCleanup,
+  readAidmFlag,
+  sceneOnlyImportOptions,
+  nonSceneDocumentNames,
+  findAdoptedScenes,
+  planAdventureSceneImport,
+  summarizeSceneConflicts,
+  MISSING_ACTORS_HINT,
+  collectionHasId,
+  createSerialLock,
   type CreatedDocRef,
   type CleanupReport,
+  type SceneImportConflict,
 } from './adventure-import-utils.js';
+import {
+  planSourceTagBackfill,
+  backfillUpdatePayload,
+  parsePackArg,
+  type BackfillPackScene,
+  type BackfillWorldScene,
+} from './adventure-source-backfill-utils.js';
 import {
   selectDefaultCombatants,
   formatScopingSummary,
   type CombatToken,
 } from './combat-scoping-utils.js';
 import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
+
+// Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
+// state and then write. This module-level lock makes those calls run one at a time INSIDE THIS ONE
+// Foundry client (the GM browser this module runs in). It does nothing about another GM client, or
+// a person in the Foundry UI, creating a document with the same id at the same moment. Queued calls
+// cannot be cancelled: a call the MCP side already gave up on (its 60 s query timeout) still runs
+// when its turn comes. If a queued call's Foundry request never settles, later calls wait behind it
+// until the page is reloaded.
+const adventureWriteLock = createSerialLock();
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
@@ -67,6 +93,8 @@ export class QueryHandlers {
       this.handleListInstalledPackages.bind(this);
     CONFIG.queries[`${modulePrefix}.adventure-import`] = this.handleAdventureImport.bind(this);
     CONFIG.queries[`${modulePrefix}.scene-integrity`] = this.handleSceneIntegrity.bind(this);
+    CONFIG.queries[`${modulePrefix}.adventure-source-backfill`] =
+      this.handleAdventureSourceBackfill.bind(this);
 
     // Phase E wall/lighting queries (audited gap: no wall/light tools existed anywhere in the
     // fork before this). Same batched-embedded-document pattern as addActorsToScene/createTokens.
@@ -2999,6 +3027,13 @@ export class QueryHandlers {
   //     import matches with keepId:true.
   // success is false whenever anything above is still unresolved, with error naming what -- this
   // handler must fail loudly rather than report success on a partially-broken import.
+  //
+  // CORRECTION, board #1714: point (2) above is wrong about why. Foundry 13.351 never read the
+  // `documentTypes` option, so that call imported EVERY document type in the Adventure entry and
+  // replaced any same-id world document. The Death House entry simply ships no actors (they live
+  // in a different entry), which is why its tokens had none. Since #1714 the import really is
+  // Scene-only, never overwrites, and creates missing actors (C) only when the caller passes
+  // import_missing_actors:true. See _importAdventureScene and adventure-import-utils.ts.
 
   // Walks regions[].behaviors[] on every given scene and resolves every Scene-rooted uuid found
   // in a behavior's data via Foundry's own fromUuidSync -- this is what makes "Scene.<id>.Region.
@@ -3060,14 +3095,78 @@ export class QueryHandlers {
         if (actorId) needed.add(actorId);
       }
     }
-    return Array.from(needed).filter(id => !(game as any).actors?.get(id));
+    // Board #1714 review: an actor whose stored data failed Foundry's validation is left out of
+    // game.actors (DocumentCollection#_initialize, foundry.mjs lines 23909-23925) but still exists
+    // in the database. It is NOT missing: treating it as missing would make adventure-import
+    // create it with keepId, and the 13.351 server silently replaces a top-level record with the
+    // same id. So invalid ids count as present here; _invalidActorIds reports them separately.
+    // invalidDocumentIds is only filled when this client loads the world, so this is only as fresh
+    // as the last page load of the GM client.
+    return Array.from(needed).filter(id => !collectionHasId((game as any).actors, id));
+  }
+
+  // Board #1714 review 2: token actor ids that point at a stored actor Foundry could not load
+  // (game.actors.invalidDocumentIds). They are not "missing" (see _missingActorIds) and are never
+  // created over, but the token still has no usable actor, so they are reported separately under
+  // invalid_actor_ids. They do not make the call fail.
+  private _invalidActorIds(scenes: any[]): string[] {
+    const invalid: any = (game as any).actors?.invalidDocumentIds;
+    const out = new Set<string>();
+    for (const scene of scenes || []) {
+      const tokens: any[] = Array.from(scene?.tokens ?? []);
+      for (const t of tokens) {
+        const actorId = t?.actorId || t?.actor?.id;
+        if (actorId && invalid?.has?.(actorId) && !(game as any).actors?.get(actorId)) {
+          out.add(actorId);
+        }
+      }
+    }
+    return Array.from(out);
+  }
+
+  // Board #1714 review 2: a create call can fail AFTER the server saved the document. The 13.351
+  // server writes the batch first and runs _onCreate afterwards (dist/database/backend/
+  // server-backend.mjs _createDocuments), and the client adds the document to its collection before
+  // running its own _onCreate (foundry.mjs lines 58658-58668, #handleCreateDocuments). So after a
+  // failed create this checks, for an id that was free just before: is it now in this client's
+  // collection ("client"), or saved on the server only because the server-side failure stopped the
+  // broadcast ("server-only", found with a read-only database get)? Either way the caller must track
+  // it for rollback. Returns null when it cannot find it.
+  private async _savedAfterFailedCreate(
+    cls: any,
+    collection: any,
+    id: string
+  ): Promise<'client' | 'server-only' | null> {
+    if (collectionHasId(collection, id)) return 'client';
+    try {
+      const impl = cls?.implementation ?? cls;
+      const found = await impl?.database?.get?.(impl, { query: { _id: id } }, (game as any).user);
+      if (Array.isArray(found) && found.length) return 'server-only';
+    } catch (e) {
+      // cannot tell; report nothing rather than guess
+    }
+    return null;
+  }
+
+  // Pushes a document found by _savedAfterFailedCreate onto the rollback list.
+  private _trackSavedAfterFailure(
+    tracker: CreatedDocRef[],
+    type: string,
+    id: string,
+    where: 'client' | 'server-only' | null
+  ): void {
+    if (!where || tracker.some(d => d.type === type && d.id === id)) return;
+    tracker.push(where === 'client' ? { type, id } : { type, id, loadedInClient: false });
   }
 
   // Searches every Adventure document in every pack in scope for actors matching the still-
   // missing ids and imports matches with keepId:true so token.actorId keeps pointing at them.
+  // Each actor it creates is pushed onto `tracker` the moment it exists, so a later failure
+  // anywhere in the call can still roll it back.
   private async _resolveActors(
     scenes: any[],
-    primaryPack: any
+    primaryPack: any,
+    tracker: CreatedDocRef[]
   ): Promise<{ importedActorIds: string[]; unresolvedActorIds: string[] }> {
     const missing = this._missingActorIds(scenes);
     if (!missing.length) return { importedActorIds: [], unresolvedActorIds: [] };
@@ -3109,17 +3208,37 @@ export class QueryHandlers {
         for (const a of actorList) {
           const srcId = a?._id || a?.id;
           if (!srcId || !stillMissing.has(srcId)) continue;
+          // Board #1714: create-only. Re-check right before writing so an actor that exists in
+          // the world (valid, or stored but invalid) is never overwritten, even if it appeared
+          // after the missing list was built.
+          if (collectionHasId((game as any).actors, srcId)) {
+            stillMissing.delete(srcId);
+            continue;
+          }
           try {
-            const actorData = a.toObject ? a.toObject() : a;
+            const actorData = JSON.parse(JSON.stringify(a.toObject ? a.toObject() : a));
+            // Folders are never imported (board #1714), so drop a folder id the world lacks.
+            if (actorData.folder && !(game as any).folders?.get(actorData.folder)) {
+              actorData.folder = null;
+            }
             const created = ActorCls?.implementation
               ? await ActorCls.implementation.createDocuments([actorData], { keepId: true })
               : await ActorCls.createDocuments([actorData], { keepId: true });
             if (created && created.length) {
+              tracker.push({ type: 'Actor', id: srcId });
               importedActorIds.push(srcId);
               stillMissing.delete(srcId);
             }
           } catch (actorErr) {
-            // leave in stillMissing -- reported unresolved below
+            // Board #1714 review 2: the create may have failed after the actor was saved. It was
+            // not in the world just above, so if it exists now this call made it: track it so
+            // rollback removes it. It stays in stillMissing, so the call reports failure.
+            this._trackSavedAfterFailure(
+              tracker,
+              'Actor',
+              srcId,
+              await this._savedAfterFailedCreate(ActorCls, (game as any).actors, srcId)
+            );
           }
         }
       }
@@ -3143,9 +3262,28 @@ export class QueryHandlers {
   // scene id. Used both to short-circuit a repeat request for the same scene, and to let a later
   // request for a SIBLING scene (already created and tagged by an earlier adventure-import call
   // for a different scene in the same Adventure entry) bind to it without re-importing anything.
-  private _findAdoptedScene(sourcePack: string, sourceSceneId: string): any {
-    const scenes: any[] = Array.from(((game as any).scenes as any) ?? []);
-    return scenes.find((s: any) => isAdoptedFrom(s, sourcePack, sourceSceneId)) || null;
+  // Board #1714: returns EVERY tagged match, so a caller can refuse when more than one world scene
+  // claims the same source instead of silently picking the first. Scenes adopted before the tags
+  // were written carry no tags and are not found here; adventure-source-backfill tags them.
+  private _findAdoptedScenes(sourcePack: string, sourceSceneId: string): any[] {
+    return findAdoptedScenes(
+      Array.from(((game as any).scenes as any) ?? []),
+      sourcePack,
+      sourceSceneId
+    );
+  }
+
+  // Refusal reply when more than one world scene is tagged as adopted from the same source.
+  private _ambiguousAdoptionResult(sourcePack: string, sourceSceneId: string, found: any[]): any {
+    return this._conflictResult([
+      {
+        scene_id: sourceSceneId,
+        scene_name: found[0]?.name ?? null,
+        reason: 'ambiguous-adopted-copies',
+        tagged_source: { sourcePack, sourceSceneId },
+        world_scene_ids: found.map((s: any) => s.id),
+      },
+    ]);
   }
 
   // Deletes every document in `created` in REVERSE order of creation (board #1311): when
@@ -3169,15 +3307,43 @@ export class QueryHandlers {
         await impl.deleteDocuments([doc.id]);
         attempts.push({ type: doc.type, id: doc.id, ok: true });
       } catch (e: any) {
+        const reason = String((e && (e.stack || e.message)) || e);
         attempts.push({
           type: doc.type,
           id: doc.id,
           ok: false,
-          error: String((e && (e.stack || e.message)) || e),
+          error:
+            doc.loadedInClient === false
+              ? `saved on the Foundry server but never loaded in this client (its create call failed), ` +
+                `so it cannot be deleted from here: reload the world and delete it by hand. ${reason}`
+              : reason,
         });
       }
     }
     return summarizeCleanup(attempts);
+  }
+
+  // Board #1714 review: every document this call creates is pushed onto one `tracker` list the
+  // moment it exists (scenes from importContent or Scene.create, actors from _resolveActors). The
+  // whole import runs inside this guard, so if ANY step throws after a create, exactly what is on
+  // that list is rolled back (0008's all-or-nothing rule), whichever path or step threw.
+  private async _runTrackedImport(run: (tracker: CreatedDocRef[]) => Promise<any>): Promise<any> {
+    const tracker: CreatedDocRef[] = [];
+    try {
+      return await run(tracker);
+    } catch (e: any) {
+      const result: any = this._emptyAdventureImportResult(
+        `adventure-import failed: ${String(e?.stack ?? e?.message ?? e)}`
+      );
+      if (tracker.length) {
+        result.imported = {
+          scenes: tracker.filter(d => d.type === 'Scene').map(d => d.id),
+          actors: tracker.filter(d => d.type === 'Actor').map(d => d.id),
+        };
+        result.cleanup = await this._rollbackCreatedDocuments(tracker.splice(0));
+      }
+      return result;
+    }
   }
 
   private async _finalizeAdventureImportResult(opts: {
@@ -3186,18 +3352,27 @@ export class QueryHandlers {
     reused: boolean;
     importedSceneIds: string[];
     pack: any;
-    createdDocs: CreatedDocRef[];
+    tracker: CreatedDocRef[];
+    importMissingActors: boolean;
   }): Promise<any> {
     const unresolvedSceneRefs = await this._resolveSceneRefs(opts.allScenes);
-    const actorResult = await this._resolveActors(opts.allScenes, opts.pack);
+    // Board #1714: creating actors is opt-in. By default adventure-import creates Scene documents
+    // only, so missing actors are reported as unresolved (and anything created is rolled back)
+    // instead of being created. With import_missing_actors:true, _resolveActors creates only the
+    // actors whose ids are not in the world at all (not even as an invalid stored record); it never
+    // updates an existing actor. Note: that also means it re-creates an actor the DM deleted on
+    // purpose, if a token still points at it.
+    const actorResult = opts.importMissingActors
+      ? await this._resolveActors(opts.allScenes, opts.pack, opts.tracker)
+      : {
+          importedActorIds: [] as string[],
+          unresolvedActorIds: this._missingActorIds(opts.allScenes),
+        };
     const success = unresolvedSceneRefs.length === 0 && actorResult.unresolvedActorIds.length === 0;
-    // Everything this call created: the tracked scene/etc. creations from opts.createdDocs, plus
-    // the actors _resolveActors just created (appended, not re-derived -- _resolveActors already
-    // knows exactly which ids it made via createDocuments and reports them in importedActorIds).
-    const allCreated: CreatedDocRef[] = [
-      ...opts.createdDocs,
-      ...actorResult.importedActorIds.map(id => ({ type: 'Actor', id })),
-    ];
+    let error = summarizeUnresolved(unresolvedSceneRefs, actorResult.unresolvedActorIds);
+    if (error && actorResult.unresolvedActorIds.length && !opts.importMissingActors) {
+      error = `${error} | ${MISSING_ACTORS_HINT}`;
+    }
     const result: any = {
       success,
       scene_id: opts.targetScene.id,
@@ -3205,35 +3380,70 @@ export class QueryHandlers {
       reused: opts.reused,
       imported: { scenes: opts.importedSceneIds, actors: actorResult.importedActorIds },
       unresolved: { scene_refs: unresolvedSceneRefs, actor_ids: actorResult.unresolvedActorIds },
-      error: summarizeUnresolved(unresolvedSceneRefs, actorResult.unresolvedActorIds),
+      invalid_actor_ids: this._invalidActorIds(opts.allScenes),
+      error,
     };
-    if (!success && allCreated.length) {
-      result.cleanup = await this._rollbackCreatedDocuments(allCreated);
+    // splice(0) empties the tracker, so the outer guard can never delete the same documents twice.
+    if (!success && opts.tracker.length) {
+      result.cleanup = await this._rollbackCreatedDocuments(opts.tracker.splice(0));
     }
     return result;
   }
 
-  private async _importStandaloneScene(parts: string[]): Promise<any> {
+  // Refusal reply for a plan with conflicts: nothing was written.
+  private _conflictResult(conflicts: SceneImportConflict[]): any {
+    return {
+      ...this._emptyAdventureImportResult(summarizeSceneConflicts(conflicts)),
+      conflicts,
+    };
+  }
+
+  // Single-scene path (3-part ref from a Scene compendium pack). It creates the scene under a NEW
+  // random id that is checked to be free first, so it does not overwrite by id. Board #1714 review: it still refuses when a world scene (valid or
+  // invalid) already holds the pack scene's id without matching tags, because that is an earlier
+  // adoption made with the same id and importing again would duplicate it. Known limit: an earlier
+  // adoption made under a different id WITHOUT source tags cannot be recognised here, so this path
+  // can still duplicate it; adventure-source-backfill only handles Adventure packs.
+  private async _importStandaloneScene(
+    parts: string[],
+    importMissingActors: boolean,
+    tracker: CreatedDocRef[]
+  ): Promise<any> {
     const [packType, packName, sceneId] = parts;
     const packCollection = `${packType}.${packName}`;
     const pack: any = (game as any).packs?.get(packCollection);
     if (!pack) return this._emptyAdventureImportResult(`Pack not found: ${packCollection}`);
 
-    const existing = this._findAdoptedScene(packCollection, sceneId);
-    if (existing) {
+    const found = this._findAdoptedScenes(packCollection, sceneId);
+    if (found.length > 1) return this._ambiguousAdoptionResult(packCollection, sceneId, found);
+    if (found.length === 1) {
       return await this._finalizeAdventureImportResult({
-        targetScene: existing,
-        allScenes: [existing],
+        targetScene: found[0],
+        allScenes: [found[0]],
         reused: true,
         importedSceneIds: [],
         pack,
-        createdDocs: [], // reused: nothing created this call, so nothing to ever roll back
+        tracker,
+        importMissingActors,
       });
     }
 
     const sourceScene: any = await pack.getDocument(sceneId);
     if (!sourceScene)
       return this._emptyAdventureImportResult(`Scene not found in pack: ${sceneId}`);
+
+    const worldCollection: any = (game as any).scenes;
+    const check = planAdventureSceneImport({
+      packCollection,
+      targetSceneId: sceneId,
+      preparedScenes: [{ _id: sceneId, name: sourceScene.name ?? null }],
+      getWorldScene: id => worldCollection?.get(id),
+      worldScenes: Array.from(worldCollection ?? []),
+      folderExists: () => true,
+      isInvalidId: id => !!worldCollection?.invalidDocumentIds?.has?.(id),
+    });
+    if (check.conflicts.length) return this._conflictResult(check.conflicts);
+
     const SceneCls: any = (globalThis as any).Scene;
     if (!SceneCls?.create)
       return this._emptyAdventureImportResult('Scene document class unavailable');
@@ -3245,34 +3455,83 @@ export class QueryHandlers {
       sourceSceneId: sceneId,
       adoptedFor: sceneId,
     };
-    const created = await SceneCls.create(sceneObj);
+    // Folders are never imported (board #1714), so drop a folder id the world does not have.
+    if (sceneObj.folder && !(game as any).folders?.get(sceneObj.folder)) sceneObj.folder = null;
+    // Board #1714 review 2: pick the new id here (a fresh random id that is free in this client,
+    // valid or invalid) and create with keepId, so that if the create call fails after the server
+    // saved the scene, this call still knows which id to look for and roll back.
+    const randomID: () => string = (globalThis as any).foundry?.utils?.randomID;
+    if (typeof randomID !== 'function') {
+      return this._emptyAdventureImportResult('foundry.utils.randomID unavailable');
+    }
+    let newId = randomID();
+    for (let i = 0; i < 5 && collectionHasId(worldCollection, newId); i++) newId = randomID();
+    if (collectionHasId(worldCollection, newId)) {
+      return this._emptyAdventureImportResult('Could not pick a free scene id');
+    }
+    sceneObj._id = newId;
+    let created: any;
+    try {
+      created = await SceneCls.create(sceneObj, { keepId: true });
+    } catch (e) {
+      this._trackSavedAfterFailure(
+        tracker,
+        'Scene',
+        newId,
+        await this._savedAfterFailedCreate(SceneCls, worldCollection, newId)
+      );
+      throw e;
+    }
     if (!created) return this._emptyAdventureImportResult('Scene.create returned no document');
+    tracker.push({ type: 'Scene', id: created.id });
     return await this._finalizeAdventureImportResult({
       targetScene: created,
       allScenes: [created],
       reused: false,
       importedSceneIds: [sceneId],
       pack,
-      createdDocs: [{ type: 'Scene', id: created.id }],
+      tracker,
+      importMissingActors,
     });
   }
 
-  private async _importAdventureScene(parts: string[]): Promise<any> {
+  // Board #1714 rewrite of the Adventure-document path. Rules, each enforced before any write:
+  //  1. Scenes only. prepareImport gets importFields:['scenes'] (the option Foundry 13.351 really
+  //     reads, see sceneOnlyImportOptions), and the prepared data is checked: if it holds any other
+  //     document type, the call is refused and nothing is written.
+  //  2. Never overwrite. Every scene the Adventure entry would import is planned with
+  //     planAdventureSceneImport: an id already used by a world scene is REUSED only when that
+  //     scene carries matching source tags; an id used by an untagged scene, a scene tagged from
+  //     elsewhere, or a stored-but-invalid scene is REFUSED with a plain error naming it, and
+  //     nothing is written. importContent is then called with a toCreate that holds only new
+  //     scenes and an EMPTY toUpdate, so its update loop (foundry.mjs lines 42019-42031) has
+  //     nothing to run.
+  //  3. Always tagged. Each created scene carries flags.aidm.sourcePack / sourceSceneId /
+  //     adoptedFor inside its create data, so the next call can find and reuse it.
+  // The whole Adventure entry's scene set is still handled in one batch (the board #1311 fix for
+  // sibling scenes), and rollback still deletes, on failure, only what this call created.
+  private async _importAdventureScene(
+    parts: string[],
+    importMissingActors: boolean,
+    tracker: CreatedDocRef[]
+  ): Promise<any> {
     const [packType, packName, advId, sceneId] = parts;
     const packCollection = `${packType}.${packName}`;
 
     // Fast path: this exact scene was already adopted by an earlier call (either as the primary
-    // target or as a sibling pulled in alongside one) -- return it, touch nothing in Foundry.
-    const existing = this._findAdoptedScene(packCollection, sceneId);
-    if (existing) {
+    // target or as a sibling pulled in alongside one) -- return it, touch no scene in Foundry.
+    const found = this._findAdoptedScenes(packCollection, sceneId);
+    if (found.length > 1) return this._ambiguousAdoptionResult(packCollection, sceneId, found);
+    if (found.length === 1) {
       const pack: any = (game as any).packs?.get(packCollection);
       return await this._finalizeAdventureImportResult({
-        targetScene: existing,
-        allScenes: [existing],
+        targetScene: found[0],
+        allScenes: [found[0]],
         reused: true,
         importedSceneIds: [],
         pack,
-        createdDocs: [], // reused: nothing created this call, so nothing to ever roll back
+        tracker,
+        importMissingActors,
       });
     }
 
@@ -3282,95 +3541,108 @@ export class QueryHandlers {
     if (!adv) return this._emptyAdventureImportResult(`Adventure not found: ${advId}`);
 
     if (!(typeof adv.prepareImport === 'function' && typeof adv.importContent === 'function')) {
-      if (typeof adv.import !== 'function') {
-        return this._emptyAdventureImportResult(
-          'Adventure document has no supported import method on this Foundry version'
-        );
-      }
-      // Older-core single-call fallback: no toCreate/toUpdate split available, so there is
-      // nothing to scope by hand here either -- import every document type the Adventure ships
-      // (never filtered to Scene alone, which is what dropped Actors on newer cores too).
-      const importResult: any = await adv.import();
-      const worldScene = (game as any).scenes?.get(sceneId);
-      if (!worldScene) {
-        return this._emptyAdventureImportResult(
-          `Adventure import ran (legacy import()) but scene ${sceneId} was not found afterward`
-        );
-      }
-      void importResult;
-      await worldScene.update(
-        aidmTagUpdatePayload({
-          sourcePack: packCollection,
-          sourceSceneId: sceneId,
-          adoptedFor: sceneId,
-        })
+      // Board #1714: the old fallback here called adv.import(), which imports every document type
+      // in the Adventure and overwrites same-id world documents. It is gone on purpose.
+      return this._emptyAdventureImportResult(
+        'Refused: this Foundry version has no Adventure prepareImport/importContent, and ' +
+          'adventure-import will not fall back to Adventure import(), because that imports every ' +
+          'document type and can overwrite existing world documents. Nothing was imported.'
       );
-      // Known limitation of this legacy fallback only (not the normal path below): adv.import()
-      // is an opaque single call with no created-documents result to read, unlike importContent's
-      // AdventureImportResult -- so only the one scene we can concretely confirm (worldScene) is
-      // tracked for rollback here. Any actors/items/journals/folders that call also created are
-      // not tracked and will NOT be rolled back on an unresolved reference -- this code refuses to
-      // guess at ids it was never told. This branch only runs against a Foundry core old enough to
-      // lack prepareImport/importContent, which the deployed v13.351 world is not (see the
-      // "Newer core" branch below, the one actually exercised live).
-      return await this._finalizeAdventureImportResult({
-        targetScene: worldScene,
-        allScenes: [worldScene],
-        reused: false,
-        importedSceneIds: [sceneId],
-        pack,
-        createdDocs: [{ type: 'Scene', id: worldScene.id }],
-      });
     }
 
-    // Newer core: prepare the FULL Scene set for this Adventure entry -- never filtered down to
-    // one scene id. This is the actual root-cause fix: importing the whole set is what lets
-    // Foundry's own id/consistency handling across the batch run for every sibling scene.
-    const toImport = await adv.prepareImport({ documentTypes: ['Scene'] });
-    const toCreateIds = new Set<string>(
-      (toImport?.toCreate?.Scene ?? []).map((s: any) => s._id || s.id)
-    );
-    const toUpdateIds = new Set<string>(
-      (toImport?.toUpdate?.Scene ?? []).map((s: any) => s._id || s.id)
-    );
-    if (!toCreateIds.has(sceneId) && !toUpdateIds.has(sceneId)) {
+    const toImport = await adv.prepareImport(sceneOnlyImportOptions());
+    const otherTypes = nonSceneDocumentNames(toImport);
+    if (otherTypes.length) {
+      return this._emptyAdventureImportResult(
+        `Refused: asked Foundry to prepare scenes only, but it also prepared ${otherTypes.join(', ')} ` +
+          'documents. This Foundry version may not honour the importFields option. Nothing was imported.'
+      );
+    }
+    const preparedScenes: any[] = [
+      ...(toImport?.toCreate?.Scene ?? []),
+      ...(toImport?.toUpdate?.Scene ?? []),
+    ];
+    if (!preparedScenes.some((s: any) => (s?._id || s?.id) === sceneId)) {
       return this._emptyAdventureImportResult(
         `Scene ${sceneId} not found in Adventure ${advId}'s scene set`
       );
     }
 
+    const worldCollection: any = (game as any).scenes;
+    const plan = planAdventureSceneImport({
+      packCollection,
+      targetSceneId: sceneId,
+      preparedScenes,
+      getWorldScene: id => worldCollection?.get(id),
+      worldScenes: Array.from(worldCollection ?? []),
+      folderExists: id => collectionHasId((game as any).folders, id),
+      isInvalidId: id => !!worldCollection?.invalidDocumentIds?.has?.(id),
+    });
+    if (plan.conflicts.length) return this._conflictResult(plan.conflicts);
+
     // importContent's own AdventureImportResult ({created, updated}, each Record<documentName,
     // Document[]> -- foundry.documents.types.AdventureImportResult) is this call's OWN record of
-    // exactly what it made, read directly rather than inferred afterward by diffing world state.
-    // Tracked BEFORE anything else can fail below, so a later unresolved reference or missing
-    // actor always has the true creation list to roll back, never a guess.
-    const importResult: any = await adv.importContent(toImport);
-    const createdDocs: CreatedDocRef[] = collectCreatedDocuments(importResult?.created);
+    // exactly what it made. If importContent throws after its create step instead, a planned id
+    // that now exists (in this client, or saved on the server only) is taken to be this call's: each
+    // one was free (not even an invalid stored record) when planned, and the write lock keeps other
+    // adventure-import calls IN THIS CLIENT out. It does not stop another GM client creating the same
+    // id at the same moment (Scene#_preCreate awaits a thumbnail first, foundry.mjs lines
+    // 46391-46406); in that rare case rollback could delete that other client's scene.
+    if (plan.create.length) {
+      let importResult: any;
+      try {
+        importResult = await adv.importContent({
+          toCreate: { Scene: plan.create },
+          toUpdate: {},
+          documentCount: plan.create.length,
+        });
+      } catch (e) {
+        for (const data of plan.create) {
+          this._trackSavedAfterFailure(
+            tracker,
+            'Scene',
+            data._id,
+            await this._savedAfterFailedCreate((globalThis as any).Scene, worldCollection, data._id)
+          );
+        }
+        throw e;
+      }
+      tracker.push(...collectCreatedDocuments(importResult?.created));
+    }
 
-    const allSourceIds = new Set<string>([...toCreateIds, ...toUpdateIds]);
+    // Tag fix-up and the scene list work only from what this call actually created (the tracker),
+    // never from the plan, so no scene that existed before this call can be touched here.
+    const createdSceneIds = tracker.filter(d => d.type === 'Scene').map(d => d.id);
     const worldScenes: any[] = [];
     const importedSceneIds: string[] = [];
-    for (const srcId of allSourceIds) {
-      const ws = (game as any).scenes?.get(srcId);
-      if (!ws) continue; // Foundry did not end up creating/updating this one -- surfaces below as
-      // a dangling reference if anything imported points at it.
+    let targetScene: any = null;
+    for (const id of createdSceneIds) {
+      const ws = worldCollection?.get(id);
+      if (!ws) continue; // not in the client collection -- surfaces as a dangling reference if needed
       worldScenes.push(ws);
-      const alreadyTagged = isAdoptedFrom(ws, packCollection, srcId);
-      if (!alreadyTagged) {
+      importedSceneIds.push(id);
+      if (id === sceneId) targetScene = ws;
+      // The tags were in the create data. Only if Foundry dropped them, write them onto this
+      // newly created scene.
+      if (!isAdoptedFrom(ws, packCollection, id)) {
         await ws.update(
           aidmTagUpdatePayload({
             sourcePack: packCollection,
-            sourceSceneId: srcId,
+            sourceSceneId: id,
             adoptedFor: sceneId,
           })
         );
       }
-      if (toCreateIds.has(srcId)) importedSceneIds.push(srcId);
+    }
+    for (const r of plan.reuse) {
+      const ws = worldCollection?.get(r.world_scene_id);
+      if (!ws) continue;
+      worldScenes.push(ws);
+      if (r.source_scene_id === sceneId) targetScene = ws;
     }
 
-    const targetScene = (game as any).scenes?.get(sceneId);
     if (!targetScene) {
-      return this._emptyAdventureImportResult(
+      throw new Error(
         `Adventure import ran but the requested scene ${sceneId} could not be located afterward`
       );
     }
@@ -3381,24 +3653,231 @@ export class QueryHandlers {
       reused: false,
       importedSceneIds,
       pack,
-      createdDocs,
+      tracker,
+      importMissingActors,
     });
   }
 
   private async handleAdventureImport(data: {
     package?: string;
     scene_ref?: string;
+    import_missing_actors?: boolean;
   }): Promise<any> {
     const gm = this.validateGMAccess();
     if (!gm.allowed) return { error: 'Access denied', success: false };
+    // One import (or back-fill apply) at a time in this client, so planning and writing cannot
+    // interleave with another call (board #1714 review).
+    return await adventureWriteLock(() =>
+      this._runTrackedImport(async tracker => {
+        if (!data?.scene_ref) throw new Error('scene_ref is required');
+        const importMissingActors = data?.import_missing_actors === true;
+        const parts = String(data.scene_ref).split('.');
+        if (parts.length === 3) {
+          return await this._importStandaloneScene(parts, importMissingActors, tracker);
+        }
+        if (parts.length === 4) {
+          return await this._importAdventureScene(parts, importMissingActors, tracker);
+        }
+        throw new Error(`Unrecognized scene_ref shape: "${data.scene_ref}"`);
+      })
+    );
+  }
+
+  // ---- adventure-source-backfill (board #1714). ----
+  // Finds world scenes that came from a scene in one installed Adventure pack but carry no
+  // flags.aidm source tags (scenes adopted before the tags were reliable), and tags them so
+  // adventure-import can reuse them instead of refusing. DRY RUN BY DEFAULT: without apply:true it
+  // only reads and reports. apply:true also needs the plan_id from a dry run of the same request,
+  // and the plan is rebuilt from live state and must still produce that same plan_id, so apply can
+  // only ever write exactly what a dry run showed. It writes only flags.aidm keys, which does not
+  // redraw the canvas even on the active scene (Scene#_onUpdate redraw list, foundry.mjs lines
+  // 46626-46632). The matching rule lives in adventure-source-backfill-utils.ts.
+  private async handleAdventureSourceBackfill(data: {
+    pack?: string;
+    package?: string;
+    scene_ids?: string[];
+    apply?: boolean;
+    plan_id?: string;
+  }): Promise<any> {
+    const gm = this.validateGMAccess();
+    if (!gm.allowed) return { error: 'Access denied', success: false };
+    const apply = data?.apply === true;
+    const mode = apply ? 'apply' : 'dry-run';
     try {
-      if (!data?.scene_ref) throw new Error('scene_ref is required');
-      const parts = String(data.scene_ref).split('.');
-      if (parts.length === 3) return await this._importStandaloneScene(parts);
-      if (parts.length === 4) return await this._importAdventureScene(parts);
-      throw new Error(`Unrecognized scene_ref shape: "${data.scene_ref}"`);
+      const packs: any[] = Array.from((game as any).packs?.values?.() || []);
+      const adventurePacks = packs
+        .filter((p: any) => p?.metadata?.type === 'Adventure')
+        .map((p: any) => p.collection);
+      const parsed = parsePackArg(data?.pack ?? data?.package);
+      if (!parsed) {
+        return {
+          success: false,
+          mode,
+          changed: false,
+          adventure_packs: adventurePacks,
+          error:
+            'pack is required (an Adventure pack id such as "module.PackName"). ' +
+            `Installed Adventure packs: ${adventurePacks.join(', ') || 'none'}.`,
+        };
+      }
+      const pack: any = (game as any).packs?.get(parsed.pack);
+      if (!pack || pack?.metadata?.type !== 'Adventure') {
+        return {
+          success: false,
+          mode,
+          changed: false,
+          adventure_packs: adventurePacks,
+          error:
+            `No installed Adventure pack "${parsed.pack}". ` +
+            `Installed Adventure packs: ${adventurePacks.join(', ') || 'none'}.`,
+        };
+      }
+
+      // With an Adventure id, load only that entry (one small round trip). Without one, load the
+      // whole pack in one getDocuments round trip instead of one getDocument call per entry (the
+      // pattern that makes list-installed-packages slow). The Curse of Strahd pack is about 17 MB of
+      // JSON across 21 entries, so naming the entry is the faster, safer call.
+      let advDocs: any[];
+      if (parsed.adventureId) {
+        const one: any = await pack.getDocument(parsed.adventureId);
+        if (!one) {
+          return {
+            success: false,
+            mode,
+            changed: false,
+            error: `No Adventure "${parsed.adventureId}" in pack "${parsed.pack}". Nothing was changed.`,
+          };
+        }
+        advDocs = [one];
+      } else {
+        advDocs = Array.from((await pack.getDocuments()) ?? []);
+      }
+      const packScenes: BackfillPackScene[] = [];
+      for (const adv of advDocs) {
+        const obj: any = adv?.toObject ? adv.toObject() : adv;
+        const advId: string = adv?.id ?? obj?._id;
+        if (parsed.adventureId && advId !== parsed.adventureId) continue;
+        for (const s of obj?.scenes ?? []) {
+          if (!s?._id) continue;
+          packScenes.push({
+            adventure_id: advId,
+            adventure_name: obj?.name ?? null,
+            scene_id: s._id,
+            name: s.name ?? null,
+            background: s.background?.src ?? s.img ?? null,
+          });
+        }
+      }
+
+      const onlySceneIds = Array.isArray(data?.scene_ids) ? data.scene_ids.map(String) : null;
+      const scope = {
+        adventure_id: parsed.adventureId,
+        scene_ids: onlySceneIds,
+      };
+      // Reads the world fresh each time it is called, so apply plans inside the write lock.
+      const buildPlan = () => {
+        const worldCollection: any = (game as any).scenes;
+        const worldScenes: BackfillWorldScene[] = Array.from(worldCollection ?? []).map(
+          (s: any) => {
+            const sourcePack = readAidmFlag(s, 'sourcePack');
+            const sourceSceneId = readAidmFlag(s, 'sourceSceneId');
+            return {
+              id: s.id,
+              name: s.name ?? null,
+              background: s.background?.src ?? null,
+              active: !!s.active,
+              token_count: Number(s.tokens?.size ?? 0),
+              duplicate_source: s._stats?.duplicateSource ?? null,
+              tags:
+                sourcePack || sourceSceneId
+                  ? { sourcePack: sourcePack ?? null, sourceSceneId: sourceSceneId ?? null }
+                  : null,
+            };
+          }
+        );
+        return planSourceTagBackfill({
+          pack: parsed.pack,
+          packScenes,
+          worldScenes,
+          onlySceneIds,
+          partialPack: !!parsed.adventureId,
+          invalidWorldIds: Array.from(worldCollection?.invalidDocumentIds ?? []).map(String),
+        });
+      };
+
+      if (!apply) {
+        const plan = buildPlan();
+        return {
+          success: true,
+          mode,
+          changed: false,
+          scope,
+          ...plan,
+          next_step: plan.will_tag.length
+            ? `Dry run only: nothing was changed. To write the ${plan.will_tag.length} tag set(s) ` +
+              'listed under will_tag, call again with the same pack and scene_ids, plus ' +
+              `apply: true and plan_id: "${plan.plan_id}".`
+            : 'Dry run only: nothing was changed, and there is nothing to tag.',
+        };
+      }
+
+      // Apply: plan and write inside the same lock adventure-import uses, so nothing can change the
+      // world between this plan and these writes from this client.
+      return await adventureWriteLock(async () => {
+        const plan = buildPlan();
+        if (!data?.plan_id || data.plan_id !== plan.plan_id) {
+          // Board #1714 review: never echo the live plan_id or the plan here. Otherwise a caller
+          // could skip the dry run by calling apply twice.
+          return {
+            success: false,
+            mode,
+            changed: false,
+            summary: plan.summary,
+            error:
+              'Refused: apply needs the plan_id returned by a dry run of this same request, and the ' +
+              'plan_id given does not match the plan built from the world now. Either no dry run ' +
+              'was run, or the world or the request changed since it ran. Nothing was changed. Run ' +
+              'the dry run again, check its will_tag list, then apply with the plan_id it returns.',
+          };
+        }
+
+        const tagged: string[] = [];
+        const failed: { scene_id: string; error: string }[] = [];
+        for (const entry of plan.will_tag) {
+          try {
+            const scene: any = (game as any).scenes?.get(entry.scene_id);
+            if (!scene) throw new Error('the scene no longer exists');
+            if (readAidmFlag(scene, 'sourcePack') || readAidmFlag(scene, 'sourceSceneId')) {
+              throw new Error('the scene gained source tags after planning; left unchanged');
+            }
+            await scene.update(backfillUpdatePayload(entry));
+            tagged.push(entry.scene_id);
+          } catch (err: any) {
+            failed.push({ scene_id: entry.scene_id, error: String(err?.message ?? err) });
+          }
+        }
+        const result: any = {
+          success: failed.length === 0,
+          mode,
+          changed: tagged.length > 0,
+          scope,
+          ...plan,
+          applied: { tagged, failed },
+        };
+        if (failed.length) {
+          result.error = `Tagged ${tagged.length} scene(s); ${failed.length} failed: ${failed
+            .map(f => `${f.scene_id} (${f.error})`)
+            .join('; ')}`;
+        }
+        return result;
+      });
     } catch (e: any) {
-      return this._emptyAdventureImportResult(String((e && (e.stack || e.message)) || e));
+      return {
+        success: false,
+        mode,
+        changed: false,
+        error: String((e && (e.stack || e.message)) || e),
+      };
     }
   }
 
@@ -3428,6 +3907,7 @@ export class QueryHandlers {
         reused: true,
         imported: { scenes: [], actors: [] },
         unresolved: { scene_refs: unresolvedSceneRefs, actor_ids: unresolvedActorIds },
+        invalid_actor_ids: this._invalidActorIds([scene]),
         error: summarizeUnresolved(unresolvedSceneRefs, unresolvedActorIds),
       };
     } catch (e: any) {

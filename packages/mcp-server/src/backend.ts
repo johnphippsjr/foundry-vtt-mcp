@@ -1812,6 +1812,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'adventure-source-backfill':
+                  result = await sceneManagementTools.handleAdventureSourceBackfill(args);
+
+                  break;
+
                 // Wall/lighting tools (Phase E)
 
                 case 'walls-create':

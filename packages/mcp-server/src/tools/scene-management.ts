@@ -152,7 +152,7 @@ export class SceneManagementTools {
       {
         name: 'adventure-import',
         description:
-          'Import one scene from an installed package into the world (the adoption lane). For an Adventure-document ref, this imports the WHOLE Adventure entry\'s scene set in one batch (never just the one scene) so cross-scene references (e.g. a region teleport to a sibling floor) resolve, then imports any actors the scene\'s tokens need from other Adventure documents in the same module (or a module it requires). Idempotent: a repeat call for a scene already adopted from this pack returns it unchanged rather than re-importing. All-or-nothing: if anything is still unresolved, every document this call created (scenes, actors, and any other document type it made) is deleted again before the reply is sent, so a failed import never leaves broken half-imported scenes behind for a user to find and clean up by hand -- reused/already-adopted documents from an earlier call are never touched. Provide the package id and the scene "ref" string exactly as returned by list-installed-packages. Returns {success, scene_id, scene_name, reused, imported:{scenes,actors}, unresolved:{scene_refs,actor_ids}, error, cleanup?}; success is false if anything is still unresolved, with error naming it; cleanup ({deleted:[{type,id}], failed:[{id,type,error}]}) is present only when something was rolled back -- failed lists, by id, anything the rollback itself could not remove.',
+          "Import one scene from an installed package into the world (the adoption lane). SCENES ONLY: for an Adventure-document ref it imports the whole Adventure entry's scene set in one batch (so a region teleport to a sibling floor resolves) and never imports or changes any other document type (actors, items, journals, folders). NEVER OVERWRITES: if a scene in that set already exists in the world under the same id, it is reused only when it carries this package's source tags (flags.aidm.sourcePack/sourceSceneId); a scene id that belongs to a stored world scene Foundry could not load (invalid data) also blocks it; otherwise the whole call is refused with success:false, an error naming each scene, and a conflicts list, and nothing is imported or changed (run adventure-source-backfill to tag scenes adopted earlier). For a 3-part ref from a Scene pack the scene is created under a new id, and the call is refused when a world scene already has the pack scene's id without matching tags; an earlier untagged adoption under a different id cannot be detected there. Every scene it creates is tagged, so a repeat call returns it unchanged (reused:true). Actors the scene's tokens need but the world lacks are reported under unresolved.actor_ids; they are created only when import_missing_actors is true (create only, from Adventure documents in the same module or a module it requires; an existing actor, or a stored actor Foundry could not load, is never changed). Warning: this also re-creates an actor the DM deleted on purpose, if a token still points at it. Calls run one at a time. All-or-nothing: if anything is still unresolved, every document this call created is deleted again before the reply is sent; reused documents are never touched. Provide the package id and the scene \"ref\" string exactly as returned by list-installed-packages. Returns {success, scene_id, scene_name, reused, imported:{scenes,actors}, unresolved:{scene_refs,actor_ids}, invalid_actor_ids?, error, cleanup?, conflicts?}; invalid_actor_ids lists token actor ids whose stored actor Foundry could not load (never created over, and it does not make the call fail); cleanup ({deleted:[{type,id}], failed:[{id,type,error}]}) is present only when something was rolled back; conflicts ([{scene_id, scene_name, reason, tagged_source, world_scene_ids}]) is present only when the import was refused to protect existing scenes.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -164,6 +164,11 @@ export class SceneManagementTools {
               type: 'string',
               description: 'Scene ref string, as returned by list-installed-packages.',
             },
+            import_missing_actors: {
+              type: 'boolean',
+              description:
+                "Default false. When true, also create actors that the imported scenes' tokens need and the world lacks (create only; an existing actor is never changed). It also re-creates an actor the DM deleted on purpose, if a token still points at it. When false, missing actors are reported under unresolved.actor_ids and the import fails and rolls back.",
+            },
           },
           required: ['package', 'scene_ref'],
         },
@@ -171,7 +176,7 @@ export class SceneManagementTools {
       {
         name: 'scene-integrity',
         description:
-          "Read-only check of a scene already in the world: walks its regions/behaviors for unresolved Scene-uuid references and diffs its tokens' actorIds against game.actors, WITHOUT importing or creating anything. Use this to check a world that was built before this fix, or as a standing gate. Returns the same {success, scene_id, scene_name, unresolved:{scene_refs,actor_ids}, error} shape as adventure-import (reused is always true, imported is always empty since nothing is imported).",
+          "Read-only check of a scene already in the world: walks its regions/behaviors for unresolved Scene-uuid references and diffs its tokens' actorIds against game.actors, WITHOUT importing or creating anything. Use this to check a world that was built before this fix, or as a standing gate. Returns the same {success, scene_id, scene_name, unresolved:{scene_refs,actor_ids}, invalid_actor_ids, error} shape as adventure-import (reused is always true, imported is always empty since nothing is imported).",
         inputSchema: {
           type: 'object',
           properties: {
@@ -181,6 +186,37 @@ export class SceneManagementTools {
               description: 'Scene name or id to locate the scene, if "scene_id" is not given.',
             },
           },
+        },
+      },
+      {
+        name: 'adventure-source-backfill',
+        description:
+          'Find world scenes that came from a scene in one installed Adventure pack but carry no source tags (adopted before the tags existed), and tag them so adventure-import reuses them instead of refusing. DRY RUN BY DEFAULT: without apply:true it only reads and reports, and changes nothing. A world scene is tagged only when it has the same id as exactly one package scene AND the same background image; weaker matches (same id but a different background, or a name/background match under a different id) are listed under needs_review and never tagged; scenes whose existing tags disagree are listed under conflicts and never changed. To write, call again with apply:true and the plan_id the dry run returned; apply refuses if the plan it rebuilds from live state has a different plan_id, and that refusal returns only a reason and the summary counts (no plan_id). plan_id is not a secret (it is a short hash of the scene ids and tags to write), so it does not prove a dry run was read; it guarantees that apply writes exactly the tag list a dry run of the current world shows, and nothing else. Apply runs one at a time with adventure-import. A pack scene whose id belongs to a stored world scene Foundry could not load is listed under conflicts. Apply writes only flags.aidm.sourcePack, sourceSceneId, adoptedFor and sourceTaggedBy. Returns {success, mode, changed, scope, pack, plan_id, summary, will_tag, already_tagged, needs_review, conflicts, next_step?, applied?:{tagged,failed}, error?}.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            pack: {
+              type: 'string',
+              description:
+                'Adventure pack id ("module.PackName"). Also accepts a list-installed-packages package id ("module.PackName:adventureId") or a scene ref, which limits the check to that Adventure entry.',
+            },
+            scene_ids: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Optional. Only check (and, with apply, only tag) these world scene ids.',
+            },
+            apply: {
+              type: 'boolean',
+              description: 'Default false (dry run). true writes the tags listed under will_tag.',
+            },
+            plan_id: {
+              type: 'string',
+              description:
+                'Required with apply:true. The plan_id from a dry run of this same request.',
+            },
+          },
+          required: ['pack'],
         },
       },
     ];
@@ -217,6 +253,7 @@ export class SceneManagementTools {
     return await this.foundryClient.query('foundry-mcp-bridge.adventure-import', {
       package: args?.package,
       scene_ref: args?.scene_ref,
+      import_missing_actors: args?.import_missing_actors === true,
     });
   }
 
@@ -224,6 +261,17 @@ export class SceneManagementTools {
     return await this.foundryClient.query('foundry-mcp-bridge.scene-integrity', {
       scene_id: args?.scene_id,
       scene_identifier: args?.scene_identifier,
+    });
+  }
+
+  // Dry run unless the caller passes apply === true exactly. plan_id is forwarded untouched so the
+  // browser-side handler can compare it with the plan it rebuilds from live state.
+  async handleAdventureSourceBackfill(args: any): Promise<any> {
+    return await this.foundryClient.query('foundry-mcp-bridge.adventure-source-backfill', {
+      pack: args?.pack ?? args?.package,
+      scene_ids: Array.isArray(args?.scene_ids) ? args.scene_ids : undefined,
+      apply: args?.apply === true,
+      plan_id: args?.plan_id,
     });
   }
 }

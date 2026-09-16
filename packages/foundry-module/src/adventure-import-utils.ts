@@ -193,6 +193,12 @@ export interface CreatedDocRef {
   /** Foundry document name, e.g. "Scene", "Actor", "JournalEntry", "Item", "Folder". */
   type: string;
   id: string;
+  /**
+   * Set to false when a create call failed but the server had already saved the document, and this
+   * Foundry client never loaded it (board #1714 review 2). Rollback cannot delete such a document
+   * from this client, and says so by id.
+   */
+  loadedInClient?: boolean;
 }
 
 /**
@@ -200,10 +206,12 @@ export interface CreatedDocRef {
  * per the official v13 API: foundry.documents.types.AdventureImportResult) into an ordered
  * `{type, id}` list, preserving both the object's key order and each array's order -- this is the
  * import call's OWN record of exactly what it made, not something inferred afterward by diffing
- * world state. Generic over whatever document names `created` carries: today `adventure-import`
- * only requests `documentTypes: ['Scene']` so only a "Scene" key is ever present, but this makes
- * no assumption about that -- if a future caller widens `documentTypes` to include Actor, Item,
- * JournalEntry, or Folder, those creations are tracked the same way with no code change here.
+ * world state. Generic over whatever document names `created` carries. Since board #1714,
+ * `adventure-import` passes importContent a Scene-only `toCreate` (see planAdventureSceneImport),
+ * so only a "Scene" key is present; any other key is still tracked the same way.
+ * (Correction, board #1714: an earlier version of this comment said the tool "only requests
+ * documentTypes: ['Scene']". Foundry 13.351 never read that option, so the old call really
+ * imported every document type in the Adventure.)
  * Entries with no usable id (`id`/`_id` both missing) are skipped rather than pushed as `undefined`.
  */
 export function collectCreatedDocuments(
@@ -253,3 +261,259 @@ export function summarizeCleanup(attempts: CleanupAttempt[]): CleanupReport {
   }
   return { deleted, failed };
 }
+
+// ---- Scene-only, never-overwrite import planning (board #1714). ----
+//
+// What was wrong: adventure-import called adv.prepareImport({documentTypes: ['Scene']}). Foundry
+// 13.351's Adventure#prepareImport (client foundry.mjs lines 41964-41995) never reads a
+// `documentTypes` option. It reads `options.importFields`, and when that list is empty it imports
+// EVERY content field (`importAll = !importFields.size || importFields.has("all")`, line 41970).
+// It then splits each field's documents by whether the world already has that id
+// (`collection.has(d._id)`, line 41976): new ids go to toCreate, existing ids go to toUpdate.
+// Adventure#importContent (lines 42000-42033) creates toCreate with keepId:true and REPLACES
+// every toUpdate document with `updateDocuments(..., {diff: false, recursive: false})`. So the old
+// call imported actors, items, journals and folders too, and silently overwrote any world
+// document that shared an id with the package, including scenes adopted and hand-edited earlier.
+//
+// The fix, in pure functions so it can be tested without a live Foundry:
+//  1. sceneOnlyImportOptions() passes the option Foundry really reads: importFields ['scenes'].
+//  2. nonSceneDocumentNames() checks the prepared data before anything is written, so a Foundry
+//     version that ignores or renames importFields is refused instead of importing everything.
+//  3. planAdventureSceneImport() decides, for every scene the package would import, whether to
+//     create it, reuse an already-adopted world scene, or refuse. It never plans an update.
+
+/**
+ * The Adventure#prepareImport options that limit an import to Scene documents only.
+ * `importFields` holds Adventure schema field names (BaseAdventure.defineSchema, foundry.mjs
+ * lines 14416-14425: actors, combats, items, journal, scenes, tables, macros, cards, playlists,
+ * folders). Because only "scenes" is listed, the folders field is skipped too (line 41973).
+ * Returns a fresh object each call so no caller can mutate a shared constant.
+ */
+export function sceneOnlyImportOptions(): { importFields: string[] } {
+  return { importFields: ['scenes'] };
+}
+
+/**
+ * Every document name in prepared import data (`{toCreate, toUpdate}`, each keyed by document
+ * name) that is not "Scene". Must be empty before importContent is allowed to run.
+ */
+export function nonSceneDocumentNames(importData: any): string[] {
+  const names = new Set<string>();
+  for (const part of [importData?.toCreate, importData?.toUpdate]) {
+    for (const [name, docs] of Object.entries(part ?? {})) {
+      if (name !== 'Scene' && Array.isArray(docs) && docs.length) names.add(name);
+    }
+  }
+  return Array.from(names);
+}
+
+/**
+ * True if a Foundry world collection already holds this id, either as a normal document or as a
+ * stored document that failed data validation.
+ *
+ * Why the second part matters (board #1714 review): DocumentCollection#_initialize (foundry.mjs
+ * lines 23909-23925) leaves a document whose stored data fails validation OUT of the collection
+ * and only records its id in `invalidDocumentIds`, so `get(id)` and `has(id)` say it does not
+ * exist (get returns it only with {invalid: true}, line 24014). The 13.351 server does not stop a
+ * keepId create that reuses a top-level id (dist/database/backend/server-backend.mjs
+ * _createDocuments only rejects duplicate ids for embedded documents), so creating that id would
+ * silently replace the stored record. Such an id must be treated as taken.
+ */
+export function collectionHasId(collection: any, id: string): boolean {
+  if (!collection || !id) return false;
+  if (collection.get?.(id)) return true;
+  return !!collection.invalidDocumentIds?.has?.(id);
+}
+
+/**
+ * A lock that runs async jobs one at a time, in call order (a promise chain). adventure-import and
+ * adventure-source-backfill apply both plan from live state and then write, so two calls handled
+ * by the same Foundry client must not interleave between the plan and the write (board #1714
+ * review). A job that throws does not block the jobs after it. It does not protect against a
+ * second GM client running its own bridge module at the same time.
+ */
+export function createSerialLock(): <T>(job: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(job: () => Promise<T>): Promise<T> => {
+    const run = tail.then(() => job());
+    tail = run.catch(() => undefined);
+    return run;
+  };
+}
+
+/** Every world document carrying the aidm source tags for this exact pack + source scene id. */
+export function findAdoptedScenes(
+  worldScenes: Iterable<any>,
+  sourcePack: string,
+  sourceSceneId: string
+): any[] {
+  const out: any[] = [];
+  for (const s of worldScenes ?? []) {
+    if (isAdoptedFrom(s, sourcePack, sourceSceneId)) out.push(s);
+  }
+  return out;
+}
+
+/** A package scene that adventure-import refused to import, and why. */
+export interface SceneImportConflict {
+  /** The id the package scene would be imported under (its own id, since import keeps ids). */
+  scene_id: string;
+  /** The world scene's name when one already holds that id, otherwise the package scene name. */
+  scene_name: string | null;
+  reason:
+    | 'id-taken-untagged'
+    | 'id-taken-other-source'
+    | 'id-taken-invalid'
+    | 'ambiguous-adopted-copies';
+  /** The source tags the blocking world scene already carries, when it carries any. */
+  tagged_source: { sourcePack: string; sourceSceneId: string } | null;
+  /** World scene ids involved (the blocking scene, or every ambiguous tagged copy). */
+  world_scene_ids: string[];
+}
+
+export interface SceneImportPlan {
+  /** Scene source data to create, with the aidm source tags already stamped in. */
+  create: any[];
+  /** Package scenes that are already adopted in the world and are used as they are. */
+  reuse: { source_scene_id: string; world_scene_id: string }[];
+  /** Package scenes that block the import. When non-empty, nothing may be written at all. */
+  conflicts: SceneImportConflict[];
+}
+
+function sourceTagsOf(doc: any): { sourcePack: string; sourceSceneId: string } | null {
+  const sourcePack = readAidmFlag(doc, 'sourcePack');
+  const sourceSceneId = readAidmFlag(doc, 'sourceSceneId');
+  if (typeof sourcePack !== 'string' && typeof sourceSceneId !== 'string') return null;
+  return { sourcePack: String(sourcePack ?? ''), sourceSceneId: String(sourceSceneId ?? '') };
+}
+
+/**
+ * Decides what adventure-import may do with each scene a package would import. The rule:
+ *  - A world scene already holds the package scene's id:
+ *      - it carries matching source tags (sourcePack + sourceSceneId): REUSE it, untouched;
+ *      - it carries no tags, or tags for a different source: CONFLICT. The import is refused and
+ *        that scene is never touched. (A same-id import would overwrite it wholesale.)
+ *  - The id belongs to a stored world scene that failed data validation (isInvalidId): CONFLICT.
+ *    Such a scene is missing from game.scenes, but a keepId create would silently replace it.
+ *  - No world scene holds the id:
+ *      - exactly one world scene is tagged as adopted from it (for example a copy made under a
+ *        new id): REUSE that one, so no duplicate is created;
+ *      - more than one is tagged: CONFLICT (ambiguous, refuse rather than guess);
+ *      - none: CREATE it, with sourcePack / sourceSceneId / adoptedFor stamped into the create
+ *        data so the new scene is findable by the next call, and with a `folder` pointing at a
+ *        folder that does not exist in the world cleared to null (folders are never imported).
+ * There is no branch that plans an update of an existing document.
+ */
+export function planAdventureSceneImport(opts: {
+  packCollection: string;
+  targetSceneId: string;
+  /** Every Scene the package would import: prepared toCreate.Scene plus toUpdate.Scene. */
+  preparedScenes: any[];
+  /** Looks up a world scene by id (game.scenes.get). */
+  getWorldScene: (id: string) => any;
+  /** All world scenes, for the source-tag lookup. */
+  worldScenes: Iterable<any>;
+  /** True if a Folder with this id exists in the world (game.folders.has). */
+  folderExists: (id: string) => boolean;
+  /** True if the world stores a scene with this id that failed validation (invalidDocumentIds). */
+  isInvalidId?: (id: string) => boolean;
+}): SceneImportPlan {
+  const plan: SceneImportPlan = { create: [], reuse: [], conflicts: [] };
+  const seen = new Set<string>();
+  const worldScenes = Array.from(opts.worldScenes ?? []);
+  for (const src of opts.preparedScenes ?? []) {
+    const srcId: string | undefined = src?._id ?? src?.id;
+    if (!srcId || seen.has(srcId)) continue;
+    seen.add(srcId);
+
+    const sameId = opts.getWorldScene(srcId);
+    if (sameId) {
+      if (isAdoptedFrom(sameId, opts.packCollection, srcId)) {
+        plan.reuse.push({ source_scene_id: srcId, world_scene_id: sameId.id ?? srcId });
+      } else {
+        const tags = sourceTagsOf(sameId);
+        plan.conflicts.push({
+          scene_id: srcId,
+          scene_name: sameId.name ?? src?.name ?? null,
+          reason: tags ? 'id-taken-other-source' : 'id-taken-untagged',
+          tagged_source: tags,
+          world_scene_ids: [sameId.id ?? srcId],
+        });
+      }
+      continue;
+    }
+
+    if (opts.isInvalidId?.(srcId)) {
+      plan.conflicts.push({
+        scene_id: srcId,
+        scene_name: src?.name ?? null,
+        reason: 'id-taken-invalid',
+        tagged_source: null,
+        world_scene_ids: [srcId],
+      });
+      continue;
+    }
+
+    const tagged = findAdoptedScenes(worldScenes, opts.packCollection, srcId);
+    if (tagged.length === 1) {
+      plan.reuse.push({ source_scene_id: srcId, world_scene_id: tagged[0].id });
+      continue;
+    }
+    if (tagged.length > 1) {
+      plan.conflicts.push({
+        scene_id: srcId,
+        scene_name: tagged[0]?.name ?? src?.name ?? null,
+        reason: 'ambiguous-adopted-copies',
+        tagged_source: { sourcePack: opts.packCollection, sourceSceneId: srcId },
+        world_scene_ids: tagged.map(t => t.id),
+      });
+      continue;
+    }
+
+    const data = JSON.parse(JSON.stringify(src));
+    data.flags = data.flags && typeof data.flags === 'object' ? data.flags : {};
+    data.flags.aidm = {
+      ...(data.flags.aidm && typeof data.flags.aidm === 'object' ? data.flags.aidm : {}),
+      sourcePack: opts.packCollection,
+      sourceSceneId: srcId,
+      adoptedFor: opts.targetSceneId,
+    };
+    if (data.folder && !opts.folderExists(data.folder)) data.folder = null;
+    plan.create.push(data);
+  }
+  return plan;
+}
+
+/** The plain-English refusal message for a plan with conflicts. */
+export function summarizeSceneConflicts(conflicts: SceneImportConflict[]): string {
+  const describe = (c: SceneImportConflict): string => {
+    const label = `"${c.scene_name ?? '(unnamed)'}" (${c.scene_id})`;
+    if (c.reason === 'id-taken-untagged') {
+      return `${label}: a world scene already has this id and is not tagged as adopted from this package`;
+    }
+    if (c.reason === 'id-taken-invalid') {
+      return `${label}: the world stores a scene with this id that failed Foundry's data checks (it is hidden from the scene list), and importing would silently replace it`;
+    }
+    if (c.reason === 'id-taken-other-source') {
+      const t = c.tagged_source;
+      return `${label}: a world scene already has this id and is tagged as coming from ${t?.sourcePack} scene ${t?.sourceSceneId}`;
+    }
+    return `${label}: ${c.world_scene_ids.length} world scenes (${c.world_scene_ids.join(', ')}) are all tagged as adopted from it`;
+  };
+  return (
+    `Refused: importing would overwrite or duplicate ${conflicts.length} existing world scene(s). ` +
+    `Nothing was imported or changed. ${conflicts.map(describe).join('; ')}. ` +
+    'If these are scenes adopted from this package earlier, run adventure-source-backfill ' +
+    '(a dry run first) to tag them, then call adventure-import again.'
+  );
+}
+
+/**
+ * Error hint added when a scene's tokens need actors that are not in the world and the caller did
+ * not ask adventure-import to create them (import_missing_actors, board #1714).
+ */
+export const MISSING_ACTORS_HINT =
+  'Missing actors were not created, because adventure-import now creates only scenes by default. ' +
+  'Call again with import_missing_actors: true to create them from the same module (it only ' +
+  'creates actors whose ids are missing, and never changes an existing actor). Warning: it also ' +
+  're-creates an actor the DM deleted on purpose, if a token still points at it.';
